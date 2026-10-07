@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.5.0
+// @version      1.5.1
 // @description  Faction scanner with preset/custom time ranges, per-member war/chain/outside-hit/OC/Xanax stats, fully themed panels, custom resize handles, and a native Torn faction action button.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
@@ -18,7 +18,7 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.5.0',
+        version: '1.5.1',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
@@ -27,7 +27,10 @@
         uiStorage: 'bftd_fws_ui_v1',
         cacheTtlMs: 365 * 24 * 60 * 60 * 1000,
         xanaxCacheTtlMs: 6 * 60 * 60 * 1000,
-        requestDelayMs: 850,
+        requestDelayMs: 1500,
+        rateLimitPauseMs: 65000,
+        maxRateLimitRetries: 6,
+        maxTransientRetries: 3,
         apiBase: 'https://api.torn.com/v2',
         customKeyUrl:
             'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=Faction%20Helper&user=faction,personalstats&faction=basic,members,attacks,crimes,news,rankedwars,rankedwarreport,chains,chainreport'
@@ -178,6 +181,13 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function formatScanDuration(ms) {
+        const totalSeconds = Math.max(0, Math.round(num(ms) / 1000));
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+    }
+
     function apiErrorMessage(payload, status = 0) {
         if (!payload) return `Torn API request failed${status ? ` (HTTP ${status})` : ''}.`;
         if (typeof payload.error === 'string') return payload.error;
@@ -188,7 +198,18 @@
         return `Torn API request failed${status ? ` (HTTP ${status})` : ''}.`;
     }
 
-    function gmJson(url, key = state.apiKey) {
+    let apiRequestQueue = Promise.resolve();
+    let lastApiRequestStartedAt = 0;
+
+    function makeApiError(message, payload = null, status = 0, kind = '') {
+        const err = new Error(message);
+        err.tornCode = num(payload?.error?.code, 0);
+        err.httpStatus = num(status, 0);
+        err.kind = kind || '';
+        return err;
+    }
+
+    function gmJsonRaw(url, key = state.apiKey) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
@@ -203,19 +224,95 @@
                     try {
                         data = JSON.parse(response.responseText || '{}');
                     } catch {
-                        reject(new Error(`Invalid JSON returned by Torn API (HTTP ${response.status}).`));
+                        reject(makeApiError(`Invalid JSON returned by Torn API (HTTP ${response.status}).`, null, response.status, 'invalid-json'));
                         return;
                     }
                     if (response.status < 200 || response.status >= 300 || data?.error) {
-                        reject(new Error(apiErrorMessage(data, response.status)));
+                        reject(makeApiError(apiErrorMessage(data, response.status), data, response.status, 'api'));
                         return;
                     }
                     resolve(data);
                 },
-                ontimeout: () => reject(new Error('Torn API request timed out.')),
-                onerror: () => reject(new Error('Could not reach the Torn API.'))
+                ontimeout: () => reject(makeApiError('Torn API request timed out.', null, 0, 'timeout')),
+                onerror: () => reject(makeApiError('Could not reach the Torn API.', null, 0, 'network'))
             });
         });
+    }
+
+    function isRateLimitError(err) {
+        const msg = String(err?.message || '').toLowerCase();
+        return num(err?.tornCode, 0) === 5 || num(err?.httpStatus, 0) === 429 || msg.includes('too many requests') || msg.includes('rate limit');
+    }
+
+    function isTransientApiError(err) {
+        const code = num(err?.tornCode, 0);
+        const status = num(err?.httpStatus, 0);
+        return code === 17 || code === 24 || ['timeout','network'].includes(String(err?.kind || '')) || status === 408 || status === 425 || status === 502 || status === 503 || status === 504;
+    }
+
+    async function interruptibleApiWait(ms) {
+        const end = Date.now() + Math.max(0, num(ms));
+        while (Date.now() < end) {
+            if (state.scanRunning && state.abortScan) throw new Error('Scan cancelled.');
+            await sleep(Math.min(500, Math.max(1, end - Date.now())));
+        }
+    }
+
+    function showApiBackoff(message) {
+        if (!state.scanRunning || !state.scanProgress) return;
+        const current = String(state.scanProgress.detail || '').replace(/\s*•\s*Torn API rate limit reached.*$/i, '').trim();
+        state.scanProgress = {
+            ...state.scanProgress,
+            detail: `${current}${current ? ' • ' : ''}${message}`
+        };
+        if (state.mainPanel && document.getElementById('bftd-fws-main')) renderMain();
+    }
+
+    async function runQueuedApiRequest(url, key) {
+        let rateRetries = 0;
+        let transientRetries = 0;
+
+        while (true) {
+            const elapsed = Date.now() - lastApiRequestStartedAt;
+            if (elapsed < APP.requestDelayMs) {
+                await interruptibleApiWait(APP.requestDelayMs - elapsed);
+            }
+
+            if (state.scanRunning && state.abortScan) throw new Error('Scan cancelled.');
+            lastApiRequestStartedAt = Date.now();
+
+            try {
+                return await gmJsonRaw(url, key);
+            } catch (err) {
+                if (isRateLimitError(err) && rateRetries < APP.maxRateLimitRetries) {
+                    rateRetries += 1;
+                    const waitMs = APP.rateLimitPauseMs;
+                    showApiBackoff(`Torn API rate limit reached — pausing ${Math.round(waitMs / 1000)}s, then retrying automatically (${rateRetries}/${APP.maxRateLimitRetries}).`);
+                    await interruptibleApiWait(waitMs);
+                    continue;
+                }
+
+                if (isTransientApiError(err) && transientRetries < APP.maxTransientRetries) {
+                    transientRetries += 1;
+                    const waitMs = transientRetries * 5000;
+                    showApiBackoff(`Temporary Torn API error — waiting ${Math.round(waitMs / 1000)}s before retry ${transientRetries}/${APP.maxTransientRetries}.`);
+                    await interruptibleApiWait(waitMs);
+                    continue;
+                }
+
+                if (isRateLimitError(err)) {
+                    throw new Error(`Torn API is still rate-limiting this user after ${APP.maxRateLimitRetries} automatic retries. Other Torn scripts may also be using the same per-user request allowance. Try again after those requests settle.`);
+                }
+                throw err;
+            }
+        }
+    }
+
+    function gmJson(url, key = state.apiKey) {
+        const run = () => runQueuedApiRequest(url, key);
+        const pending = apiRequestQueue.then(run, run);
+        apiRequestQueue = pending.catch(() => undefined);
+        return pending;
     }
 
     function apiUrl(path, params = {}) {
@@ -379,6 +476,68 @@
                 background: #332020;
                 color: #f3a0a0;
             }
+            .bftd-fws-custom-dates {
+                display:grid;
+                grid-template-columns:repeat(2,minmax(0,1fr));
+                gap:9px;
+                margin-top:10px;
+            }
+            .bftd-fws-date-card {
+                position:relative;
+                display:block;
+                border:2px solid color-mix(in srgb, var(--bftd-accent) 65%, var(--bftd-border));
+                background:linear-gradient(180deg, rgba(230,185,74,.10), rgba(0,0,0,.06));
+                border-radius:9px;
+                padding:9px;
+                box-shadow:0 0 0 1px rgba(255,255,255,.025), inset 0 0 18px rgba(230,185,74,.04);
+                transition:border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+            }
+            .bftd-fws-date-card:hover, .bftd-fws-date-card:focus-within {
+                border-color:var(--bftd-accent);
+                box-shadow:0 0 0 2px rgba(230,185,74,.18), 0 0 18px rgba(230,185,74,.12);
+            }
+            .bftd-fws-date-label {
+                display:flex;
+                align-items:center;
+                justify-content:space-between;
+                gap:8px;
+                margin-bottom:7px;
+                color:var(--bftd-text);
+                font-size:10px;
+                font-weight:900;
+                letter-spacing:.35px;
+            }
+            .bftd-fws-date-input-row { display:flex; align-items:center; gap:6px; }
+            .bftd-fws-date-input-row .bftd-fws-input {
+                height:40px;
+                border-color:color-mix(in srgb, var(--bftd-accent) 42%, var(--bftd-border));
+                font-weight:700;
+                background:#0f1113;
+            }
+            .bftd-fws-date-input-row .bftd-fws-input:focus {
+                border-color:var(--bftd-accent);
+                box-shadow:0 0 0 2px rgba(230,185,74,.14);
+            }
+            .bftd-fws-date-input-row input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+                cursor:pointer;
+                opacity:1;
+                filter:invert(85%) sepia(49%) saturate(591%) hue-rotate(350deg) brightness(101%) contrast(91%);
+            }
+            .bftd-fws-picker-btn {
+                width:42px;
+                min-width:42px;
+                height:40px;
+                border:2px solid var(--bftd-accent);
+                border-radius:8px;
+                background:#342d1c;
+                color:#ffe09a;
+                cursor:pointer;
+                font-size:19px;
+                line-height:1;
+                box-shadow:0 0 12px rgba(230,185,74,.12);
+            }
+            .bftd-fws-picker-btn:hover { background:#443a22; box-shadow:0 0 16px rgba(230,185,74,.22); }
+            .bftd-fws-picker-btn:disabled { opacity:.45; cursor:not-allowed; box-shadow:none; }
             .bftd-fws-periods { display:grid; grid-template-columns: repeat(5,1fr); gap:6px; }
             .bftd-fws-period {
                 border: 1px solid var(--bftd-border);
@@ -453,6 +612,7 @@
             }
             @keyframes bftdFwsSlide { from{ transform:translateX(-100%);} to{transform:translateX(300%);} }
             @media (max-width: 700px) {
+                .bftd-fws-custom-dates { grid-template-columns:1fr; }
                 #bftd-fws-main, #bftd-fws-stats {
                     width: calc(100vw - 18px) !important;
                     height: calc(100vh - 30px) !important;
@@ -2251,6 +2411,7 @@
             ocCount: num(scan.ocCount),
             armoryPageCount: num(scan.armoryPageCount),
             armoryNewsCount: num(scan.armoryNewsCount),
+            scanDurationMs: Math.max(0, num(scan.scanDurationMs)),
             membersSnapshot: membersSnapshot.length ? cloneMembersSnapshot(membersSnapshot) : cloneMembersSnapshot(state.members),
             importedAt: Date.now(),
             importedFromVersion: String(payload.appVersion || 'unknown'),
@@ -2303,7 +2464,7 @@
         const scanStatus = state.scanRunning
             ? (state.scanProgress?.message || 'Scanning faction data…')
             : ready
-                ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s) • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
+                ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s)${cached.scanDurationMs ? ` • completed in ${formatScanDuration(cached.scanDurationMs)}` : ''} • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
                 : 'No completed scan for this period. Members are locked until the scan finishes.';
 
         body.innerHTML = `
@@ -2327,12 +2488,20 @@
                     `).join('')}
                 </div>
                 ${state.selectedPreset === 'custom' ? `
-                    <div class="bftd-fws-grid" style="margin-top:9px;grid-template-columns:repeat(2,minmax(0,1fr)) !important">
-                        <label class="bftd-fws-note" style="display:block">START DATE / TIME
-                            <input id="bftd-fws-custom-start" class="bftd-fws-input" type="datetime-local" step="60" value="${esc(state.customStart)}" ${state.scanRunning ? 'disabled' : ''} style="margin-top:4px">
+                    <div class="bftd-fws-custom-dates">
+                        <label class="bftd-fws-date-card">
+                            <span class="bftd-fws-date-label"><span>START DATE / TIME</span><span>📅</span></span>
+                            <span class="bftd-fws-date-input-row">
+                                <input id="bftd-fws-custom-start" class="bftd-fws-input" type="datetime-local" step="60" value="${esc(state.customStart)}" ${state.scanRunning ? 'disabled' : ''}>
+                                <button type="button" class="bftd-fws-picker-btn" data-picker="start" title="Open start calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
+                            </span>
                         </label>
-                        <label class="bftd-fws-note" style="display:block">END DATE / TIME
-                            <input id="bftd-fws-custom-end" class="bftd-fws-input" type="datetime-local" step="60" value="${esc(state.customEnd)}" ${state.customStart ? `min="${esc(state.customStart)}"` : ''} ${customMaxEnd ? `max="${esc(localDateTimeInputValue(customMaxEnd))}"` : ''} ${state.scanRunning ? 'disabled' : ''} style="margin-top:4px">
+                        <label class="bftd-fws-date-card">
+                            <span class="bftd-fws-date-label"><span>END DATE / TIME</span><span>📅</span></span>
+                            <span class="bftd-fws-date-input-row">
+                                <input id="bftd-fws-custom-end" class="bftd-fws-input" type="datetime-local" step="60" value="${esc(state.customEnd)}" ${state.customStart ? `min="${esc(state.customStart)}"` : ''} ${customMaxEnd ? `max="${esc(localDateTimeInputValue(customMaxEnd))}"` : ''} ${state.scanRunning ? 'disabled' : ''}>
+                                <button type="button" class="bftd-fws-picker-btn" data-picker="end" title="Open end calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
+                            </span>
                         </label>
                     </div>
                     <div class="bftd-fws-note" style="margin-top:6px">
@@ -2389,6 +2558,20 @@
 
         const customStartInput = body.querySelector('#bftd-fws-custom-start');
         const customEndInput = body.querySelector('#bftd-fws-custom-end');
+        body.querySelectorAll('[data-picker]').forEach(btn => {
+            btn.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                const target = btn.dataset.picker === 'end' ? customEndInput : customStartInput;
+                if (!target || target.disabled) return;
+                try {
+                    if (typeof target.showPicker === 'function') target.showPicker();
+                    else { target.focus(); target.click(); }
+                } catch {
+                    target.focus();
+                }
+            });
+        });
         customStartInput?.addEventListener('change', () => {
             state.customStart = customStartInput.value;
             const startDate = parseLocalDateTimeInput(state.customStart);
@@ -2475,6 +2658,7 @@
             return;
         }
         state.scanRunning = true;
+        const scanStartedAt = Date.now();
         state.abortScan = false;
         state.scanError = '';
         state.shareMessage = '';
@@ -2489,28 +2673,24 @@
             });
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            await sleep(APP.requestDelayMs);
             setScanProgress('2/5 — Loading chain history & reports…', 'Finding completed chains that started inside the selected period and loading member participation.');
             const chainScan = await scanFactionChainsAndReports(range, (done, total, apiCalls, cacheHits, pages) => {
                 setScanProgress('2/5 — Loading chain history & reports…', `${done}/${total} chain reports processed • ${pages} history page(s) • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
             });
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            await sleep(APP.requestDelayMs);
             setScanProgress('3/5 — Scanning all faction attacks…', `Classifying war hits, assists, retals and outside attacks across ${warScan.wars.length} ranked-war window(s).`);
             const attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks) => {
                 setScanProgress('3/5 — Scanning all faction attacks…', `${pages} attack page(s) • ${attacks} outgoing attacks checked`);
             });
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            await sleep(APP.requestDelayMs);
             setScanProgress('4/5 — Scanning completed organized crimes…', 'Counting completed OCs by executed_at and participant slot.');
             const ocScan = await scanFactionCrimes(range, (pages, crimes) => {
                 setScanProgress('4/5 — Scanning completed organized crimes…', `${pages} OC page(s) • ${crimes} completed OC(s) checked`);
             });
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            await sleep(APP.requestDelayMs);
             setScanProgress('5/5 — Scanning faction armory Xanax…', 'Counting Xanax armory actions by member.');
             const armoryScan = await scanFactionArmoryXanax(range, (pages, newsCount) => {
                 setScanProgress('5/5 — Scanning faction armory Xanax…', `${pages} armory-news page(s) • ${newsCount} record(s) checked`);
@@ -2545,9 +2725,13 @@
                 ocScan.pageCount,
                 ocScan.crimeCount,
                 armoryScan.pageCount,
-                armoryScan.newsCount
+                armoryScan.newsCount,
+                Date.now() - scanStartedAt
             );
 
+            const completedIn = formatScanDuration(Date.now() - scanStartedAt);
+            state.shareMessage = `Scan completed in ${completedIn}.`;
+            state.shareMessageType = '';
             state.lastAggregates = attackScan.aggregates;
             state.lastOcAggregates = ocScan.aggregates;
             state.lastArmoryXanaxAggregates = armoryScan.aggregates;
@@ -2691,7 +2875,7 @@
         saveCacheStore(store);
     }
 
-    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount) {
+    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0) {
         savePeriodCacheEntry(range, {
             generatedAt: Date.now(),
             range,
@@ -2706,6 +2890,7 @@
             ocCount,
             armoryPageCount,
             armoryNewsCount,
+            scanDurationMs: Math.max(0, num(scanDurationMs)),
             membersSnapshot: cloneMembersSnapshot(state.members)
         });
     }
@@ -2819,7 +3004,6 @@
             if (nextTo >= cursorTo) break;
             cursorTo = nextTo;
             if (historyPages > 1000) throw new Error('Chain history exceeded the safety limit (1,000 pages).');
-            await sleep(APP.requestDelayMs);
         }
 
         selected.sort((a, b) => a.start - b.start);
@@ -2838,8 +3022,7 @@
                 report = extractChainReport(payload);
                 reportApiCalls += 1;
                 if (report) putCachedChainReport(chain.id, report);
-                await sleep(APP.requestDelayMs);
-            }
+                }
 
             if (report) {
                 const attackers = Array.isArray(report?.attackers) ? report.attackers : Object.values(report?.attackers || {});
@@ -2949,7 +3132,6 @@
             if (rows.length < 100 || (oldestStart && oldestStart < range.from)) break;
             offset += rows.length;
             if (historyPages > 500) throw new Error('Ranked-war history exceeded the safety limit (500 pages).');
-            await sleep(APP.requestDelayMs);
         }
 
         selected.sort((a, b) => a.start - b.start);
@@ -2969,8 +3151,7 @@
                 report = extractRankedWarReport(payload);
                 reportApiCalls += 1;
                 if (report) putCachedWarReport(war.id, report);
-                await sleep(APP.requestDelayMs);
-            }
+                }
 
             if (report) {
                 const own = reportOwnFaction(report);
@@ -3264,7 +3445,6 @@
             const nextTo = oldestTs - 1;
             if (nextTo >= cursorTo) break;
             cursorTo = nextTo;
-            await sleep(APP.requestDelayMs);
             if (pageCount > 6000) throw new Error('Attack pagination exceeded the safety limit (6,000 pages).');
         }
 
@@ -3387,7 +3567,6 @@
             }
 
             cursorTo = nextTo;
-            await sleep(APP.requestDelayMs);
 
             if (pageCount > 6000) {
                 throw new Error('OC pagination exceeded the safety limit (6,000 pages).');
@@ -3532,7 +3711,6 @@
             if (nextTo >= cursorTo) break;
 
             cursorTo = nextTo;
-            await sleep(APP.requestDelayMs);
 
             if (pageCount > 6000) {
                 throw new Error('Armory-news pagination exceeded the safety limit (6,000 pages).');
@@ -3598,7 +3776,6 @@
             stat: 'xantaken',
             timestamp: range.from
         }));
-        await sleep(APP.requestDelayMs);
         const endPayload = await gmJson(apiUrl(`/user/${encodeURIComponent(member.id)}/personalstats`, {
             stat: 'xantaken',
             timestamp: range.to
