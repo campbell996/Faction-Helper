@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.5.1
+// @version      1.5.2
 // @description  Faction scanner with preset/custom time ranges, per-member war/chain/outside-hit/OC/Xanax stats, fully themed panels, custom resize handles, and a native Torn faction action button.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
@@ -18,12 +18,13 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.5.1',
+        version: '1.5.2',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
         warReportCacheStorage: 'bftd_fh_war_report_cache_v1',
         chainReportCacheStorage: 'bftd_fh_chain_report_cache_v1',
+        includeChainsStorage: 'bftd_fh_include_chains_v1',
         uiStorage: 'bftd_fws_ui_v1',
         cacheTtlMs: 365 * 24 * 60 * 60 * 1000,
         xanaxCacheTtlMs: 6 * 60 * 60 * 1000,
@@ -45,6 +46,7 @@
         selectedPreset: '6m',
         customStart: '',
         customEnd: '',
+        includeChains: Boolean(GM_getValue('bftd_fh_include_chains_v1', false)),
         search: '',
         currentMember: null,
         mainPanel: null,
@@ -2102,7 +2104,7 @@
                 <div style="font-weight:800;margin-bottom:6px">Faction API key required</div>
                 <div class="bftd-fws-note">
                     This script only unlocks when your Torn position has <b>Faction API Access</b>.
-                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>chains</b>, <b>chainreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history.
+                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>chains</b> and <b>chainreport</b> are only required when the Include Chains option is enabled.
                     The key is stored locally in this userscript manager and is sent only to Torn's API.
                 </div>
             </div>
@@ -2143,7 +2145,7 @@
             <div class="bftd-fws-card">
                 <div class="bftd-fws-note">
                     Required: your Torn faction position must have <b>Faction API Access</b>, and the API key must allow
-                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/chains</b>, <b>faction/chainreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>.
+                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/chains</b> and <b>faction/chainreport</b> are additionally required only when Include Chains is enabled.
                 </div>
                 <div class="bftd-fws-row" style="margin-top:9px">
                     <button id="bftd-fws-retry" class="bftd-fws-btn">RETRY</button>
@@ -2405,6 +2407,7 @@
             armoryXanaxAggregates: scan.armoryXanaxAggregates,
             warSummary: scan.warSummary,
             chainSummary: scan.chainSummary && typeof scan.chainSummary === 'object' ? scan.chainSummary : null,
+            chainsIncluded: scan.chainsIncluded === true || Boolean(scan.chainSummary && typeof scan.chainSummary === 'object'),
             pageCount: num(scan.pageCount),
             fetchedCount: num(scan.fetchedCount),
             ocPageCount: num(scan.ocPageCount),
@@ -2464,7 +2467,7 @@
         const scanStatus = state.scanRunning
             ? (state.scanProgress?.message || 'Scanning faction data…')
             : ready
-                ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s)${cached.scanDurationMs ? ` • completed in ${formatScanDuration(cached.scanDurationMs)}` : ''} • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
+                ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s) • ${cached.chainSummary ? 'chains included' : 'chains not included'}${cached.scanDurationMs ? ` • completed in ${formatScanDuration(cached.scanDurationMs)}` : ''} • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
                 : 'No completed scan for this period. Members are locked until the scan finishes.';
 
         body.innerHTML = `
@@ -2509,8 +2512,18 @@
                     </div>
                     ${!customValidation.valid && (state.customStart || state.customEnd) ? `<div class="bftd-fws-error" style="margin-top:8px">${esc(customValidation.message)}</div>` : ''}
                 ` : ''}
+                <div class="bftd-fws-card" style="margin-top:8px;padding:9px 10px">
+                    <label class="bftd-fws-row" style="cursor:${state.scanRunning ? 'default' : 'pointer'};align-items:flex-start">
+                        <input id="bftd-fws-include-chains" type="checkbox" ${state.includeChains ? 'checked' : ''} ${state.scanRunning ? 'disabled' : ''} style="margin:2px 2px 0 0;transform:scale(1.2);accent-color:var(--bftd-accent)">
+                        <span class="bftd-fws-grow">
+                            <b>INCLUDE CHAINS IN THIS SCAN</b><br>
+                            <span class="bftd-fws-note">${state.includeChains ? 'ON — completed-chain history and chain reports will be scanned.' : 'OFF — all chain history/report API calls will be skipped.'}</span>
+                        </span>
+                    </label>
+                    <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Enabling chains can add many extra API calls, especially over long periods with lots of completed chains. Leave this unticked when chain participation is not needed.</div>
+                </div>
                 <div class="bftd-fws-note" style="margin-top:7px">
-                    The scan first finds every ranked war and completed chain that <b>started inside the selected period</b>, loads their reports, then scans all outgoing faction attacks in the period so war hits, assists, retals and outside hits are classified against the exact war windows/opponents. It then scans completed OCs and faction-armory Xanax actions. Running the same 1M / 3M / 6M / 12M period again replaces that period's previous saved scan. Re-running the exact same Custom start/end range replaces that saved Custom scan.
+                    The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report.${state.includeChains ? ' It also finds completed chains that started inside the selected period and loads their reports.' : ' Chain scanning is currently <b>OFF</b>, so no chain history or chain-report requests will be made.'} It then scans all outgoing faction attacks in the period so war hits, assists, retals and outside hits are classified against the exact war windows/opponents, followed by completed OCs and faction-armory Xanax actions. Running the same 1M / 3M / 6M / 12M period again replaces that period's previous saved scan. Re-running the exact same Custom start/end range replaces that saved Custom scan.
                 </div>
                 <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The larger the selected time period is, the longer the scan may take to complete. Multi-year scans can take significantly longer because Faction Helper must load and process much more Torn history.</div>
                 <div class="bftd-fws-scanstatus">
@@ -2595,6 +2608,15 @@
             renderMain();
         });
 
+        body.querySelector('#bftd-fws-include-chains')?.addEventListener('change', event => {
+            state.includeChains = Boolean(event.target.checked);
+            GM_setValue(APP.includeChainsStorage, state.includeChains);
+            state.scanError = '';
+            state.shareMessage = '';
+            state.shareMessageType = '';
+            renderMain();
+        });
+
         body.querySelector('#bftd-fws-scan')?.addEventListener('click', () => runFactionScan(true));
         body.querySelector('#bftd-fws-cancel-main-scan')?.addEventListener('click', () => { state.abortScan = true; });
         body.querySelector('#bftd-fws-download-scan')?.addEventListener('click', () => {
@@ -2657,6 +2679,8 @@
             renderMain();
             return;
         }
+        const includeChains = Boolean(state.includeChains);
+        const totalStages = includeChains ? 5 : 4;
         state.scanRunning = true;
         const scanStartedAt = Date.now();
         state.abortScan = false;
@@ -2667,33 +2691,43 @@
         renderMain();
 
         try {
-            setScanProgress('1/5 — Loading ranked-war history & reports…', 'Finding wars that started inside the selected period. Completed war reports are cached permanently by war ID.');
+            setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, 'Finding wars that started inside the selected period. Completed war reports are cached permanently by war ID.');
             const warScan = await scanRankedWarsAndReports(range, (done, total, apiCalls, cacheHits) => {
-                setScanProgress('1/5 — Loading ranked-war history & reports…', `${done}/${total} war reports processed • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
+                setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `${done}/${total} war reports processed • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
             });
 
-            if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress('2/5 — Loading chain history & reports…', 'Finding completed chains that started inside the selected period and loading member participation.');
-            const chainScan = await scanFactionChainsAndReports(range, (done, total, apiCalls, cacheHits, pages) => {
-                setScanProgress('2/5 — Loading chain history & reports…', `${done}/${total} chain reports processed • ${pages} history page(s) • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
-            });
+            let chainScan = { summary: null };
+            let stage = 2;
+            if (includeChains) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                setScanProgress(`${stage}/${totalStages} — Loading chain history & reports…`, 'Finding completed chains that started inside the selected period and loading member participation.');
+                chainScan = await scanFactionChainsAndReports(range, (done, total, apiCalls, cacheHits, pages) => {
+                    setScanProgress(`${stage}/${totalStages} — Loading chain history & reports…`, `${done}/${total} chain reports processed • ${pages} history page(s) • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
+                });
+                stage += 1;
+            }
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress('3/5 — Scanning all faction attacks…', `Classifying war hits, assists, retals and outside attacks across ${warScan.wars.length} ranked-war window(s).`);
+            setScanProgress(`${stage}/${totalStages} — Scanning all faction attacks…`, `Classifying war hits, assists, retals and outside attacks across ${warScan.wars.length} ranked-war window(s).`);
+            const attackStage = stage;
             const attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks) => {
-                setScanProgress('3/5 — Scanning all faction attacks…', `${pages} attack page(s) • ${attacks} outgoing attacks checked`);
+                setScanProgress(`${attackStage}/${totalStages} — Scanning all faction attacks…`, `${pages} attack page(s) • ${attacks} outgoing attacks checked`);
             });
+            stage += 1;
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress('4/5 — Scanning completed organized crimes…', 'Counting completed OCs by executed_at and participant slot.');
+            setScanProgress(`${stage}/${totalStages} — Scanning completed organized crimes…`, 'Counting completed OCs by executed_at and participant slot.');
+            const ocStage = stage;
             const ocScan = await scanFactionCrimes(range, (pages, crimes) => {
-                setScanProgress('4/5 — Scanning completed organized crimes…', `${pages} OC page(s) • ${crimes} completed OC(s) checked`);
+                setScanProgress(`${ocStage}/${totalStages} — Scanning completed organized crimes…`, `${pages} OC page(s) • ${crimes} completed OC(s) checked`);
             });
+            stage += 1;
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress('5/5 — Scanning faction armory Xanax…', 'Counting Xanax armory actions by member.');
+            setScanProgress(`${stage}/${totalStages} — Scanning faction armory Xanax…`, 'Counting Xanax armory actions by member.');
+            const armoryStage = stage;
             const armoryScan = await scanFactionArmoryXanax(range, (pages, newsCount) => {
-                setScanProgress('5/5 — Scanning faction armory Xanax…', `${pages} armory-news page(s) • ${newsCount} record(s) checked`);
+                setScanProgress(`${armoryStage}/${totalStages} — Scanning faction armory Xanax…`, `${pages} armory-news page(s) • ${newsCount} record(s) checked`);
             });
 
             const warSummary = {
@@ -2726,11 +2760,12 @@
                 ocScan.crimeCount,
                 armoryScan.pageCount,
                 armoryScan.newsCount,
-                Date.now() - scanStartedAt
+                Date.now() - scanStartedAt,
+                includeChains
             );
 
             const completedIn = formatScanDuration(Date.now() - scanStartedAt);
-            state.shareMessage = `Scan completed in ${completedIn}.`;
+            state.shareMessage = `Scan completed in ${completedIn}${includeChains ? ' with chains included' : ' without chains'}.`;
             state.shareMessageType = '';
             state.lastAggregates = attackScan.aggregates;
             state.lastOcAggregates = ocScan.aggregates;
@@ -2875,7 +2910,7 @@
         saveCacheStore(store);
     }
 
-    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0) {
+    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0, chainsIncluded = false) {
         savePeriodCacheEntry(range, {
             generatedAt: Date.now(),
             range,
@@ -2884,6 +2919,7 @@
             armoryXanaxAggregates,
             warSummary,
             chainSummary,
+            chainsIncluded: Boolean(chainsIncluded),
             pageCount,
             fetchedCount,
             ocPageCount,
