@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.7.9
+// @version      1.7.10
 // @description  Faction scanner with 1-12 month rolling presets plus temporary Custom scans, Basic/Fast or detailed war-data modes, a rolling 12-month master local data cache, optional accurate per-chain reports, a separate faction-members panel, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
@@ -18,7 +18,7 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.7.9',
+        version: '1.7.10',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
@@ -252,6 +252,17 @@
         return (Array.isArray(rows) ? rows : [])
             .map(row => [Math.floor(num(row?.[0])), Math.floor(num(row?.[1]))])
             .filter(([from, to]) => from > 0 && to >= from);
+    }
+
+    async function historyCheckpointCoverage(type, sourceRanges, verifiedFrom, verifiedTo) {
+        const from = Math.floor(num(verifiedFrom));
+        const to = Math.floor(num(verifiedTo));
+        if (!from || !to || to < from) return;
+        for (const [rangeFrom, rangeTo] of cloneMissingRanges(sourceRanges)) {
+            const a = Math.max(from, rangeFrom);
+            const b = Math.min(to, rangeTo);
+            if (b >= a) await historyMarkCoverage(type, a, b);
+        }
     }
 
     function scanPlanSummary(plan) {
@@ -3403,7 +3414,7 @@
             const cachePlan = await buildMasterCacheScanPlan(range);
             if (!detailedWarData) cachePlan.attacks = [];
             if (!includeChains) cachePlan.chains = [];
-            setScanProgress(customScan ? 'Master Data checked — Custom downloads stay temporary' : 'Master Data Cache checked', `${scanPlanSummary(cachePlan)}${detailedWarData ? '' : ' • attacks: skipped (Basic/Fast war mode)'}${includeChains ? '' : ' • chains: skipped'}. Only uncovered intervals and missing report IDs will be requested from Torn.${customScan ? ' Newly downloaded Custom Scan data will NOT be written to Master.' : ''}`);
+            setScanProgress(customScan ? 'Master Data checked — Custom downloads stay temporary' : 'Master Data Cache checked', `${scanPlanSummary(cachePlan)}${detailedWarData ? '' : ' • attacks: skipped (Basic/Fast war mode)'}${includeChains ? '' : ' • chains: skipped'}. Only uncovered intervals and missing report IDs will be requested from Torn. Coverage is checkpointed after every successfully saved API page, so partial scans resume from the remaining gap instead of rereading completed pages.${customScan ? ' Newly downloaded Custom Scan data will NOT be written to Master.' : ''}`);
 
             setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `Using Master Data Cache first • ${cachePlan.wars.length} uncovered war-history range(s). Completed war reports are cached permanently by war ID.`);
             const warScan = await scanRankedWarsAndReports(range, (done, total, apiCalls, cacheHits) => {
@@ -4010,6 +4021,13 @@
                 for (const chain of rows) {
                     if (!oldestStart || chain.start < oldestStart) oldestStart = chain.start;
                 }
+                if (oldestStart) {
+                    const checkpointTo = Math.min(cursorTo, stableTo);
+                    const checkpointFrom = Math.max(gapFrom, oldestStart + 1);
+                    if (checkpointTo >= checkpointFrom) {
+                        await historyMarkCoverage('chains', checkpointFrom, checkpointTo);
+                    }
+                }
                 onProgress?.(historyPages, apiChainsSeen, fetchRanges.length, r + 1);
                 if (!rows.length) break;
 
@@ -4035,7 +4053,10 @@
                 if (historyPages > 1000) throw new Error('Chain history exceeded the safety limit (1,000 pages).');
             }
             // Do not freeze the recent cooldown tail into coverage; it is intentionally refreshed later.
-            if (gapComplete && gapTo <= stableTo) await historyMarkCoverage('chains', gapFrom, gapTo);
+            // Stable history is still finalized even when the requested gap also includes that live tail.
+            if (gapComplete && gapFrom <= stableTo) {
+                await historyMarkCoverage('chains', gapFrom, Math.min(gapTo, stableTo));
+            }
         }
 
         const cachedChains = await historyGetRecords('chains', range.from, range.to);
@@ -4134,6 +4155,15 @@
                 let oldestStart = 0;
                 for (const war of normalized) {
                     if (!oldestStart || war.start < oldestStart) oldestStart = war.start;
+                }
+
+                // Persist verified history coverage after every successful page. If a scan is
+                // interrupted later (rate limit, daily read limit, cancel, browser close), the
+                // pages already downloaded remain reusable on the next scan. Keep the oldest
+                // page-boundary second open until the next page/final completion so equal-time
+                // records cannot be skipped.
+                if (oldestStart) {
+                    await historyCheckpointCoverage('wars', missingRanges, oldestStart + 1, range.to);
                 }
 
                 if (rows.length < 100 || (oldestStart && oldestStart <= earliestNeeded)) {
@@ -4651,6 +4681,12 @@
                     fetchedRows.push(compact);
                 }
                 await historyPutRecords('attacks', compactPage, row => row.id, row => row.ended);
+                if (oldestTs) {
+                    const checkpointFrom = Math.max(gapFrom, oldestTs + 1);
+                    if (cursorTo >= checkpointFrom) {
+                        await historyMarkCoverage('attacks', checkpointFrom, cursorTo);
+                    }
+                }
                 onProgress?.(pageCount, fetchedRows.length, missingRanges.length, r + 1, 0);
 
                 if (!attacks.length) break;
@@ -4810,6 +4846,12 @@
                     fetchedRows.push(compact);
                 }
                 await historyPutRecords('crimes', compactPage, row => row.id, row => row.executed_at);
+                if (oldestTs) {
+                    const checkpointFrom = Math.max(gapFrom, oldestTs + 1);
+                    if (cursorTo >= checkpointFrom) {
+                        await historyMarkCoverage('crimes', checkpointFrom, cursorTo);
+                    }
+                }
                 onProgress?.(pageCount, fetchedRows.length, 0, missingRanges.length, r + 1);
 
                 if (!crimes.length || crimes.length < 100 || !oldestTs || oldestTs <= gapFrom) break;
@@ -4998,6 +5040,12 @@
                     fetchedRows.push(compact);
                 }
                 await historyPutRecords('armory', compactPage, row => row.id, row => row.timestamp);
+                if (oldestTs) {
+                    const checkpointFrom = Math.max(gapFrom, oldestTs + 1);
+                    if (cursorTo >= checkpointFrom) {
+                        await historyMarkCoverage('armory', checkpointFrom, cursorTo);
+                    }
+                }
                 onProgress?.(pageCount, fetchedRows.length, 0, missingRanges.length, r + 1);
 
                 if (!news.length || news.length < 100 || !oldestTs || oldestTs <= gapFrom) break;
