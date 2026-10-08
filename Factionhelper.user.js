@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.7.5
-// @description  Faction scanner with exact-range quick snapshots, persistent master local data cache, optional accurate per-chain reports, a separate faction-members panel, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
+// @version      1.7.9
+// @description  Faction scanner with 1-12 month rolling presets plus temporary Custom scans, Basic/Fast or detailed war-data modes, a rolling 12-month master local data cache, optional accurate per-chain reports, a separate faction-members panel, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
 // @connect      api.torn.com
@@ -18,13 +18,14 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.7.5',
+        version: '1.7.9',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
         warReportCacheStorage: 'bftd_fh_war_report_cache_v1',
         chainReportCacheStorage: 'bftd_fh_chain_report_cache_v1',
         includeChainsStorage: 'bftd_fh_include_chains_v1',
+        detailedWarDataStorage: 'bftd_fh_detailed_war_data_v1',
         uiStorage: 'bftd_fws_ui_v1',
         cacheTtlMs: 365 * 24 * 60 * 60 * 1000,
         xanaxCacheTtlMs: 6 * 60 * 60 * 1000,
@@ -44,10 +45,12 @@
         faction: null,
         members: [],
         memberMap: new Map(),
-        selectedPreset: 'custom',
+        selectedPreset: 'rolling',
+        selectedMonths: 6,
         customStart: '',
         customEnd: '',
         includeChains: Boolean(GM_getValue(APP.includeChainsStorage, false)),
+        detailedWarData: Boolean(GM_getValue(APP.detailedWarDataStorage, true)),
         search: '',
         currentMember: null,
         mainPanel: null,
@@ -70,11 +73,14 @@
         launcherObserver: null,
         launcherSyncTimer: null,
         factionActionRow: null,
-        factionActionTemplate: null
+        factionActionTemplate: null,
+        masterWindowAnchorTo: 0,
+        transientHistory: null
     };
 
     const HISTORY_DB_NAME = 'BFTD_Faction_Helper_History';
     const HISTORY_DB_VERSION = 1;
+    const ATTACK_HISTORY_SCHEMA_VERSION = 2;
     let historyDbPromise = null;
     let historyDbUnavailable = false;
 
@@ -162,11 +168,29 @@
     }
 
     async function historyMarkCoverage(type, from, to) {
+        from = Math.floor(num(from));
+        to = Math.floor(num(to));
+        if (!historyFactionId() || !from || to < from) return;
+
+        // Custom scans are strictly read-through: missing data may be downloaded,
+        // but coverage discovered by that scan must never expand the rolling master.
+        if (state.transientHistory) {
+            const current = state.transientHistory.coverage[type] || [];
+            state.transientHistory.coverage[type] = mergeCoverageIntervals([...current, [from, to]]);
+            return;
+        }
+
         const db = await openHistoryDb();
-        if (!db || !historyFactionId() || !from || to < from) return;
+        if (!db) return;
+        const rolling = rollingMasterWindow();
+        from = Math.max(from, rolling.from);
+        to = Math.min(to, rolling.to);
+        if (!from || to < from) return;
         try {
             const existing = await historyGetCoverage(type);
-            const intervals = mergeCoverageIntervals([...existing, [Math.floor(from), Math.floor(to)]]);
+            const intervals = mergeCoverageIntervals([...existing, [from, to]])
+                .map(([a, b]) => [Math.max(a, rolling.from), Math.min(b, rolling.to)])
+                .filter(([a, b]) => b >= a);
             const tx = db.transaction('coverage', 'readwrite');
             tx.objectStore('coverage').put({ key: historyCoverageKey(type), intervals, updatedAt: Date.now() });
             await idbTransactionDone(tx);
@@ -178,10 +202,21 @@
     async function historyMissingRanges(type, from, to) {
         from = Math.floor(num(from));
         to = Math.floor(num(to));
+        if (!state.transientHistory) {
+            const rolling = rollingMasterWindow();
+            from = Math.max(from, rolling.from);
+            to = Math.min(to, rolling.to);
+        }
         if (!from || !to || to < from) return [];
         const db = await openHistoryDb();
-        if (!db || !historyFactionId()) return [[from, to]];
-        const coverage = await historyGetCoverage(type);
+        if ((!db && !state.transientHistory) || !historyFactionId()) return [[from, to]];
+        let masterCoverage = db ? await historyGetCoverage(type) : [];
+        if (type === 'attacks' && db) {
+            const meta = await historyGetRecordById('masterMeta', 'latest');
+            if (num(meta?.attackHistorySchemaVersion) !== ATTACK_HISTORY_SCHEMA_VERSION) masterCoverage = [];
+        }
+        const transientCoverage = state.transientHistory?.coverage?.[type] || [];
+        const coverage = mergeCoverageIntervals([...masterCoverage, ...transientCoverage]);
         const missing = [];
         let cursor = from;
         for (const [a, b] of coverage) {
@@ -231,9 +266,25 @@
     }
 
     async function historyPutRecords(type, rows, idGetter, tsGetter) {
-        const db = await openHistoryDb();
         const factionId = historyFactionId();
-        if (!db || !factionId || !Array.isArray(rows) || !rows.length) return;
+        if (!factionId || !Array.isArray(rows) || !rows.length) return;
+
+        // Custom-scan downloads are held in a temporary in-memory overlay. They
+        // participate in this scan's calculations but are never written to master.
+        if (state.transientHistory) {
+            if (!state.transientHistory.records[type]) state.transientHistory.records[type] = new Map();
+            const bucket = state.transientHistory.records[type];
+            for (const data of rows) {
+                const id = String(idGetter(data) ?? '');
+                const ts = Math.floor(num(tsGetter(data)));
+                if (!id || !ts) continue;
+                bucket.set(id, { id, ts, data });
+            }
+            return;
+        }
+
+        const db = await openHistoryDb();
+        if (!db) return;
         try {
             const tx = db.transaction('records', 'readwrite');
             const store = tx.objectStore('records');
@@ -241,6 +292,10 @@
                 const id = String(idGetter(data) ?? '');
                 const ts = Math.floor(num(tsGetter(data)));
                 if (!id || !ts) continue;
+                if (type !== 'masterMeta') {
+                    const rolling = rollingMasterWindow();
+                    if (ts < rolling.from || ts > rolling.to) continue;
+                }
                 store.put({
                     key: `${factionId}:${type}:${id}`,
                     factionId,
@@ -258,19 +313,31 @@
     async function historyGetRecords(type, from, to) {
         const db = await openHistoryDb();
         const factionId = historyFactionId();
-        if (!db || !factionId) return [];
-        try {
-            const tx = db.transaction('records', 'readonly');
-            const index = tx.objectStore('records').index('byFactionTypeTs');
-            const range = IDBKeyRange.bound(
-                [factionId, type, Math.floor(num(from))],
-                [factionId, type, Math.floor(num(to))]
-            );
-            const rows = await idbRequest(index.getAll(range));
-            return (rows || []).map(row => row.data).filter(Boolean);
-        } catch {
-            return [];
+        if (!factionId) return [];
+        const start = Math.floor(num(from));
+        const end = Math.floor(num(to));
+        const combined = new Map();
+        if (db) {
+            try {
+                const tx = db.transaction('records', 'readonly');
+                const index = tx.objectStore('records').index('byFactionTypeTs');
+                const range = IDBKeyRange.bound([factionId, type, start], [factionId, type, end]);
+                const rows = await idbRequest(index.getAll(range));
+                for (const row of rows || []) combined.set(String(row.key), row.data);
+            } catch {
+                // Continue with any temporary custom-scan overlay.
+            }
         }
+        const bucket = state.transientHistory?.records?.[type];
+        if (bucket) {
+            for (const entry of bucket.values()) {
+                if (entry.ts < start || entry.ts > end) continue;
+                combined.set(`temp:${type}:${entry.id}`, entry.data);
+            }
+        }
+        let values = [...combined.values()].filter(Boolean);
+        if (type === 'attacks') values = values.filter(row => num(row?._schema) === ATTACK_HISTORY_SCHEMA_VERSION);
+        return values;
     }
 
     function historyRecordKey(type, id) {
@@ -278,9 +345,12 @@
     }
 
     async function historyGetRecordById(type, id) {
-        const db = await openHistoryDb();
         const factionId = historyFactionId();
-        if (!db || !factionId || id === undefined || id === null || id === '') return null;
+        if (!factionId || id === undefined || id === null || id === '') return null;
+        const temp = state.transientHistory?.records?.[type]?.get(String(id));
+        if (temp?.data) return temp.data;
+        const db = await openHistoryDb();
+        if (!db) return null;
         try {
             const tx = db.transaction('records', 'readonly');
             const row = await idbRequest(tx.objectStore('records').get(historyRecordKey(type, id)));
@@ -355,7 +425,8 @@
                     to: Math.floor(num(range?.to))
                 },
                 chainsIncluded: Boolean(extra?.chainsIncluded),
-                lastScanDurationMs: Math.max(0, num(extra?.scanDurationMs))
+                lastScanDurationMs: Math.max(0, num(extra?.scanDurationMs)),
+                attackHistorySchemaVersion: ATTACK_HISTORY_SCHEMA_VERSION
             }],
             row => row.id,
             row => row.ts
@@ -396,9 +467,112 @@
         GM_setValue(APP.chainReportCacheStorage, '{}');
     }
 
+    async function clearMasterCacheTypeForFaction(type) {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        if (!db || !factionId || !type) return;
+        try {
+            const tx = db.transaction('records', 'readwrite');
+            const store = tx.objectStore('records');
+            await new Promise((resolve, reject) => {
+                const request = store.openCursor();
+                request.onerror = () => reject(request.error || new Error(`Could not clear ${type} master records.`));
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return resolve();
+                    const row = cursor.value || {};
+                    if (Number(row.factionId) === factionId && row.type === type) cursor.delete();
+                    cursor.continue();
+                };
+            });
+            await idbTransactionDone(tx);
+
+            const covTx = db.transaction('coverage', 'readwrite');
+            covTx.objectStore('coverage').delete(historyCoverageKey(type));
+            await idbTransactionDone(covTx);
+        } catch (err) {
+            throw new Error(`Could not refresh the ${type} Master Cache: ${err?.message || err}`);
+        }
+    }
+
+    async function ensureDetailedAttackHistorySchema() {
+        const meta = await historyGetRecordById('masterMeta', 'latest');
+        if (num(meta?.attackHistorySchemaVersion) === ATTACK_HISTORY_SCHEMA_VERSION) return false;
+
+        // v1.7.8 and older compacted attacks without Torn's is_ranked_war flag
+        // or started timestamp. Those records cannot reproduce RWPH Advanced
+        // classification reliably, especially final hits that end after the RW timer.
+        await clearMasterCacheTypeForFaction('attacks');
+        const nowSec = Math.floor(Date.now() / 1000);
+        await historyPutRecords('masterMeta', [{
+            ...(meta || {}),
+            id: 'latest',
+            ts: nowSec,
+            updatedAt: Date.now(),
+            attackHistorySchemaVersion: ATTACK_HISTORY_SCHEMA_VERSION
+        }], row => row.id, row => row.ts);
+        return true;
+    }
+
 
     const MASTER_CACHE_EXPORT_TYPES = ['attacks', 'wars', 'warReports', 'chains', 'chainReports', 'crimes', 'armory'];
     const MASTER_CACHE_COVERAGE_TYPES = ['attacks', 'wars', 'chains', 'crimes', 'armory'];
+
+    async function pruneMasterCacheToRollingWindow() {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        const rolling = rollingMasterWindow();
+        if (!db || !factionId || !rolling.from || !rolling.to) return { deletedRecords:0, clippedCoverage:0, ...rolling };
+
+        let deletedRecords = 0;
+        let clippedCoverage = 0;
+        try {
+            const tx = db.transaction('records', 'readwrite');
+            const store = tx.objectStore('records');
+            await new Promise((resolve, reject) => {
+                const request = store.openCursor();
+                request.onerror = () => reject(request.error || new Error('Could not prune master records.'));
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return resolve();
+                    const row = cursor.value || {};
+                    if (Number(row.factionId) === factionId && row.type !== 'masterMeta') {
+                        const ts = Math.floor(num(row.ts));
+                        if (!ts || ts < rolling.from || ts > rolling.to) {
+                            cursor.delete();
+                            deletedRecords += 1;
+                        }
+                    }
+                    cursor.continue();
+                };
+            });
+            await idbTransactionDone(tx);
+
+            const covTx = db.transaction('coverage', 'readwrite');
+            const covStore = covTx.objectStore('coverage');
+            await new Promise((resolve, reject) => {
+                const request = covStore.openCursor();
+                request.onerror = () => reject(request.error || new Error('Could not prune master coverage.'));
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return resolve();
+                    if (String(cursor.key || '').startsWith(`${factionId}:`)) {
+                        const intervals = mergeCoverageIntervals(cursor.value?.intervals || [])
+                            .map(([from, to]) => [Math.max(from, rolling.from), Math.min(to, rolling.to)])
+                            .filter(([from, to]) => to >= from);
+                        if (intervals.length) cursor.update({ ...cursor.value, intervals, updatedAt: Date.now() });
+                        else cursor.delete();
+                        clippedCoverage += 1;
+                    }
+                    cursor.continue();
+                };
+            });
+            await idbTransactionDone(covTx);
+        } catch (err) {
+            throw new Error(`Could not maintain the rolling 12-month Master Data Cache: ${err?.message || err}`);
+        }
+        return { deletedRecords, clippedCoverage, ...rolling };
+    }
 
     async function historyGetAllRecords(type) {
         return historyGetRecords(type, 0, Number.MAX_SAFE_INTEGER);
@@ -407,6 +581,7 @@
     async function exportMasterCacheFile() {
         const factionId = historyFactionId();
         if (!factionId) throw new Error('Faction details are not loaded yet.');
+        await pruneMasterCacheToRollingWindow();
         const records = {};
         const coverage = {};
         for (const type of MASTER_CACHE_EXPORT_TYPES) records[type] = await historyGetAllRecords(type);
@@ -414,7 +589,8 @@
         const masterMeta = await historyGetRecordById('masterMeta', 'latest');
         const payload = {
             kind: 'FactionHelperMasterCache',
-            schemaVersion: 1,
+            schemaVersion: 2,
+            attackHistorySchemaVersion: ATTACK_HISTORY_SCHEMA_VERSION,
             appVersion: APP.version,
             exportedAt: Date.now(),
             faction: {
@@ -438,7 +614,7 @@
         } catch {
             throw new Error('The selected master-cache file is not valid JSON.');
         }
-        if (!payload || payload.kind !== 'FactionHelperMasterCache' || Number(payload.schemaVersion) !== 1) {
+        if (!payload || payload.kind !== 'FactionHelperMasterCache' || ![1, 2].includes(Number(payload.schemaVersion))) {
             throw new Error('This is not a valid Faction Helper Master Data Cache file.');
         }
         const factionId = Number(payload?.faction?.id || 0);
@@ -447,8 +623,12 @@
         }
 
         const records = payload.records && typeof payload.records === 'object' ? payload.records : {};
+        const importedAttackSchemaOk = Number(payload.attackHistorySchemaVersion) === ATTACK_HISTORY_SCHEMA_VERSION;
+        const importedAttacks = importedAttackSchemaOk
+            ? (Array.isArray(records.attacks) ? records.attacks.filter(row => num(row?._schema) === ATTACK_HISTORY_SCHEMA_VERSION) : [])
+            : [];
         const specs = [
-            ['attacks', records.attacks, row => row?.id, row => row?.ended],
+            ['attacks', importedAttacks, row => row?.id, row => row?.ended],
             ['wars', records.wars, row => row?.id, row => row?.start],
             ['warReports', records.warReports, row => row?.id, row => row?.ts || row?.start],
             ['chains', records.chains, row => row?.id, row => row?.start],
@@ -478,6 +658,10 @@
 
         const coverage = payload.coverage && typeof payload.coverage === 'object' ? payload.coverage : {};
         for (const type of MASTER_CACHE_COVERAGE_TYPES) {
+            // Old master exports do not contain enough detailed attack fields for
+            // Advanced/RWPH-equivalent classification. Never import their attack
+            // coverage, otherwise the corrected scanner could think the range is complete.
+            if (type === 'attacks' && !importedAttackSchemaOk) continue;
             for (const row of mergeCoverageIntervals(coverage[type] || [])) {
                 await historyMarkCoverage(type, row[0], row[1]);
             }
@@ -493,8 +677,10 @@
             completedScans: Math.max(num(currentMeta?.completedScans), num(incomingMeta?.completedScans)),
             lastRange: incomingMeta?.lastRange || currentMeta?.lastRange || null,
             chainsIncluded: Boolean(incomingMeta?.chainsIncluded || currentMeta?.chainsIncluded),
-            lastScanDurationMs: Math.max(0, num(incomingMeta?.lastScanDurationMs || currentMeta?.lastScanDurationMs))
+            lastScanDurationMs: Math.max(0, num(incomingMeta?.lastScanDurationMs || currentMeta?.lastScanDurationMs)),
+            attackHistorySchemaVersion: ATTACK_HISTORY_SCHEMA_VERSION
         }], row => row.id, row => row.ts);
+        await pruneMasterCacheToRollingWindow();
     }
 
     const SUCCESS_RESULTS = new Set(['attacked', 'mugged', 'hospitalized', 'special', 'bounty', 'looted']);
@@ -987,7 +1173,7 @@
             }
             .bftd-fws-picker-btn:hover { background:#443a22; box-shadow:0 0 16px rgba(230,185,74,.22); }
             .bftd-fws-picker-btn:disabled { opacity:.45; cursor:not-allowed; box-shadow:none; }
-            .bftd-fws-periods { display:grid; grid-template-columns: repeat(5,1fr); gap:6px; }
+            .bftd-fws-periods { display:grid; grid-template-columns: repeat(6,1fr); gap:6px; }
             .bftd-fws-period {
                 border: 1px solid var(--bftd-border);
                 background: #171a1d;
@@ -1390,7 +1576,7 @@
             .bftd-fws-btn.danger { background:#332020 !important; color:#f3a0a0 !important; border-color:#633b3b !important; }
             .bftd-fws-btn:disabled { opacity:.46; cursor:not-allowed; }
 
-            .bftd-fws-periods { grid-template-columns:repeat(5,minmax(0,1fr)) !important; }
+            .bftd-fws-periods { grid-template-columns:repeat(6,minmax(0,1fr)) !important; }
             .bftd-fws-period { min-width:0; background:var(--bftd-input) !important; color:var(--bftd-text) !important; border-radius:7px !important; }
             .bftd-fws-period.active {
                 border-color:var(--bftd-accent) !important;
@@ -1647,7 +1833,7 @@
                     right:auto;
                 }
                 .bftd-fws-grid { grid-template-columns:repeat(auto-fit,minmax(112px,1fr)) !important; }
-                .bftd-fws-periods { grid-template-columns:repeat(2,minmax(0,1fr)) !important; }
+                .bftd-fws-periods { grid-template-columns:repeat(3,minmax(0,1fr)) !important; }
             }
         `;
         document.head.appendChild(style);
@@ -1954,49 +2140,112 @@
         return result;
     }
 
+
+    function rollingMasterWindow(nowValue = null) {
+        const effectiveNow = nowValue ?? (state.masterWindowAnchorTo ? state.masterWindowAnchorTo * 1000 : Date.now());
+        const end = effectiveNow instanceof Date ? new Date(effectiveNow.getTime()) : new Date(effectiveNow);
+        if (!Number.isFinite(end.getTime())) return { start:null, end:null, from:0, to:0 };
+        end.setMilliseconds(0);
+        const start = addCalendarMonthsClamped(end, -12);
+        return {
+            start,
+            end,
+            from: Math.floor(start.getTime() / 1000),
+            to: Math.floor(end.getTime() / 1000)
+        };
+    }
+
+    function clampPresetMonths(value) {
+        return Math.max(1, Math.min(12, Math.floor(num(value, 1))));
+    }
+
+    function inferPresetMonths(range) {
+        const from = Math.floor(num(range?.from));
+        const to = Math.floor(num(range?.to));
+        if (!from || !to || to <= from) return clampPresetMonths(state.selectedMonths || 6);
+        const end = new Date(to * 1000);
+        let bestMonth = 1;
+        let bestDiff = Number.POSITIVE_INFINITY;
+        for (let month = 1; month <= 12; month += 1) {
+            const expected = Math.floor(addCalendarMonthsClamped(end, -month).getTime() / 1000);
+            const diff = Math.abs(expected - from);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestMonth = month;
+            }
+        }
+        return bestMonth;
+    }
+
     function customRangeValidation() {
         const start = parseLocalDateTimeInput(state.customStart);
         const end = parseLocalDateTimeInput(state.customEnd);
-        if (!start) return { valid:false, message:'Choose a custom start date and time.' };
-        if (!end) return { valid:false, message:'Choose a custom end date and time.' };
-        if (end.getTime() <= start.getTime()) return { valid:false, message:'The custom end date/time must be after the start date/time.' };
-        const maxEnd = addCalendarMonthsClamped(start, 60);
-        if (end.getTime() > maxEnd.getTime()) {
-            return { valid:false, message:`Custom scans are limited to 60 months. The latest allowed end is ${maxEnd.toLocaleString()}.`, maxEnd };
+        const customMode = state.selectedPreset === 'custom';
+        if (!start || !end) return { valid:false, message:customMode ? 'Choose both a Custom Scan start and end date/time.' : 'Choose a 1-12 month preset.' };
+        if (end.getTime() <= start.getTime()) return { valid:false, message:'The scan start must be before the scan end.' };
+        const now = new Date();
+        now.setMilliseconds(0);
+        if (end.getTime() > now.getTime() + 5000) return { valid:false, message:'The scan end cannot be later than the current date/time.' };
+
+        if (customMode) {
+            const earliestForEnd = addCalendarMonthsClamped(end, -60);
+            if (start.getTime() < earliestForEnd.getTime() - 1000) {
+                return { valid:false, message:'Custom Scans are limited to a maximum of 60 calendar months (5 years).' };
+            }
+            return { valid:true, start, end, custom:true };
         }
-        return { valid:true, start, end, maxEnd };
+
+        const rolling = rollingMasterWindow(Date.now());
+        const earliestForEnd = addCalendarMonthsClamped(end, -12);
+        if (start.getTime() < earliestForEnd.getTime() - 1000) {
+            return { valid:false, message:'Rolling scans are limited to a maximum of 12 calendar months.' };
+        }
+        return { valid:true, start, end, rolling, custom:false };
     }
 
     function ensureScanRangeInitialized() {
         if (parseLocalDateTimeInput(state.customStart) && parseLocalDateTimeInput(state.customEnd)) return;
-        const end = new Date();
-        end.setMilliseconds(0);
-        const start = addCalendarMonthsClamped(end, -6);
-        state.customStart = localDateTimeInputValue(start);
-        state.customEnd = localDateTimeInputValue(end);
+        applyQuickRange(state.selectedMonths || 6);
     }
 
     function applyQuickRange(months) {
+        months = clampPresetMonths(months);
         const end = new Date();
         end.setMilliseconds(0);
-        const start = addCalendarMonthsClamped(end, -Math.max(1, Number(months || 1)));
+        const start = addCalendarMonthsClamped(end, -months);
+        state.selectedMonths = months;
         state.customStart = localDateTimeInputValue(start);
         state.customEnd = localDateTimeInputValue(end);
+        state.selectedPreset = 'rolling';
+    }
+
+    function activateCustomRange() {
+        ensureScanRangeInitialized();
         state.selectedPreset = 'custom';
     }
 
     function getPresetRange() {
         ensureScanRangeInitialized();
         const validation = customRangeValidation();
+        const customMode = state.selectedPreset === 'custom';
         if (!validation.valid) {
-            return { code:'custom', label:'Selected time period', from:0, to:0, valid:false, validationMessage:validation.message };
+            return { code:customMode ? 'custom' : 'rolling', label:customMode ? 'Custom Scan' : 'Selected time period', from:0, to:0, valid:false, validationMessage:validation.message, custom:customMode };
         }
         return {
-            code:'custom',
-            label:'Selected time period',
+            code:customMode ? 'custom' : 'rolling',
+            label:customMode ? 'Custom Scan' : `Last ${clampPresetMonths(state.selectedMonths)} month${clampPresetMonths(state.selectedMonths) === 1 ? '' : 's'}`,
             from: Math.floor(validation.start.getTime() / 1000),
             to: Math.floor(validation.end.getTime() / 1000),
-            valid:true
+            valid:true,
+            custom:customMode
+        };
+    }
+
+    function createTransientHistory(range) {
+        return {
+            range: { from: Math.floor(num(range?.from)), to: Math.floor(num(range?.to)) },
+            records: {},
+            coverage: {}
         };
     }
 
@@ -2562,7 +2811,7 @@
                 <div style="font-weight:800;margin-bottom:6px">Faction API key required</div>
                 <div class="bftd-fws-note">
                     This script only unlocks when your Torn position has <b>Faction API Access</b>.
-                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>chains</b> and <b>chainreport</b> are only required when the Include Chains option is enabled.
+                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>faction/attacks</b> is only required when Detailed War Data is enabled. <b>chains</b> and <b>chainreport</b> are only required when the Include Chains option is enabled.
                     The key is stored locally in this userscript manager and is sent only to Torn's API.
                 </div>
             </div>
@@ -2603,7 +2852,7 @@
             <div class="bftd-fws-card">
                 <div class="bftd-fws-note">
                     Required: your Torn faction position must have <b>Faction API Access</b>, and the API key must allow
-                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/chains</b> and <b>faction/chainreport</b> are additionally required only when Include Chains is enabled.
+                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/attacks</b> is additionally required only when Detailed War Data is enabled. <b>faction/chains</b> and <b>faction/chainreport</b> are additionally required only when Include Chains is enabled.
                 </div>
                 <div class="bftd-fws-row" style="margin-top:9px">
                     <button id="bftd-fws-retry" class="bftd-fws-btn">RETRY</button>
@@ -2701,11 +2950,7 @@
         }
         if (info?.access?.faction !== true) {
             try {
-                await gmJson(apiUrl('/faction/attacks', {
-                    filters: 'outgoing',
-                    limit: 1,
-                    sort: 'DESC'
-                }));
+                await gmJson(apiUrl('/faction/rankedwars', { limit: 1 }));
             } catch (err) {
                 throw new Error(`Faction API Access could not be verified. Torn API said: ${err.message}`);
             }
@@ -2722,6 +2967,11 @@
         };
         state.members = members.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
         state.memberMap = new Map(state.members.map(m => [Number(m.id), m]));
+        try {
+            await pruneMasterCacheToRollingWindow();
+        } catch {
+            // Master-cache maintenance must never prevent the helper from opening.
+        }
     }
 
     function safeDownloadName(value, fallback = 'faction-helper') {
@@ -2756,16 +3006,14 @@
         ensureScanRangeInitialized();
         const requestedRange = getPresetRange();
         const customValidation = customRangeValidation();
-        const customStartDate = parseLocalDateTimeInput(state.customStart);
-        const customMaxEnd = customStartDate ? addCalendarMonthsClamped(customStartDate, 60) : null;
         const cached = requestedRange.valid !== false ? getCached(requestedRange) : null;
         const scannedRange = cached?.range || null;
         const ready = Boolean(cached?.aggregates && cached?.ocAggregates && cached?.armoryXanaxAggregates && cached?.warSummary);
-        const scanLabel = state.scanRunning ? 'SCANNING…' : (ready ? 'RESCAN FACTION' : 'SCAN FACTION');
+        const scanLabel = state.scanRunning ? 'SCANNING…' : (state.selectedPreset === 'custom' ? (ready ? 'RESCAN CUSTOM' : 'SCAN CUSTOM') : (ready ? 'RESCAN FACTION' : 'SCAN FACTION'));
         const scanStatus = state.scanRunning
             ? (state.scanProgress?.message || 'Scanning faction data…')
             : ready
-                ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s) • ${cached.chainSummary ? 'chains included' : 'chains not included'}${cached.scanDurationMs ? ` • completed in ${formatScanDuration(cached.scanDurationMs)}` : ''} • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
+                ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s) • ${cached.detailedWarDataIncluded === false ? 'Basic/Fast war data' : 'Detailed war data'} • ${cached.chainSummary ? 'chains included' : 'chains not included'}${cached.scanDurationMs ? ` • completed in ${formatScanDuration(cached.scanDurationMs)}` : ''} • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
                 : 'No completed scan for this exact Start/End range. Members are locked until the scan finishes.';
 
         body.innerHTML = `
@@ -2782,33 +3030,46 @@
             <div class="bftd-fws-card">
                 <div class="bftd-fws-note" style="margin-bottom:6px">SCAN DATE / TIME RANGE</div>
                 <div class="bftd-fws-periods" style="margin-bottom:9px">
-                    ${[['1M',1],['3M',3],['6M',6],['12M',12]].map(([label,months]) => `
-                        <button class="bftd-fws-period" data-quick-months="${months}" ${state.scanRunning ? 'disabled' : ''}>${label}</button>
+                    ${Array.from({length:12}, (_, index) => index + 1).map(months => `
+                        <button class="bftd-fws-period ${state.selectedPreset !== 'custom' && clampPresetMonths(state.selectedMonths) === months ? 'active' : ''}" data-quick-months="${months}" ${state.scanRunning ? 'disabled' : ''}>${months}M</button>
                     `).join('')}
+                    <button class="bftd-fws-period ${state.selectedPreset === 'custom' ? 'active' : ''}" id="bftd-fws-custom-mode" title="Custom Scan can reuse Master Cache data, but any additional data it downloads is temporary and will NOT be saved into the rolling 12-month Master Cache." ${state.scanRunning ? 'disabled' : ''}>CUSTOM ⚠</button>
                 </div>
-                <div class="bftd-fws-note" style="margin:-2px 0 8px">
-                    Quick buttons only fill the date/time selectors below. They set <b>End</b> to the current local date/time and <b>Start</b> to exactly 1, 3, 6 or 12 calendar months earlier. You can edit either field before scanning.
-                </div>
+                ${state.selectedPreset === 'custom' ? `
+                    <div class="bftd-fws-warning" style="margin:0 0 8px"><b>⚠ CUSTOM SCAN — DOES NOT UPDATE MASTER DATA:</b> Choose your own Start and End date/time (maximum 60 months / 5 years). Faction Helper will reuse any matching records already present in the rolling 12-month Master Cache, but any missing data downloaded for this Custom Scan is temporary only. It will <b>not</b> be added to, expand, or replace the Master Cache. The completed Custom Scan can still be saved as a quick-reload snapshot.</div>
+                ` : `
+                    <div class="bftd-fws-note" style="margin:-2px 0 8px">Choose how far back to scan. <b>End Date / Time is always the current local date/time</b>, and Start Date / Time is automatically set exactly 1-12 calendar months earlier. The dates cannot be edited manually.</div>
+                `}
                 <div class="bftd-fws-custom-dates">
                     <label class="bftd-fws-date-card">
-                        <span class="bftd-fws-date-label"><span>START DATE / TIME</span><span>📅</span></span>
+                        <span class="bftd-fws-date-label"><span>START DATE / TIME</span><span>${state.selectedPreset === 'custom' ? '📅' : '🔒'}</span></span>
                         <span class="bftd-fws-date-input-row">
-                            <input id="bftd-fws-custom-start" class="bftd-fws-input" type="datetime-local" step="1" value="${esc(state.customStart)}" ${state.scanRunning ? 'disabled' : ''}>
-                            <button type="button" class="bftd-fws-picker-btn" data-picker="start" title="Open start calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
+                            <input id="bftd-fws-custom-start" class="bftd-fws-input" type="datetime-local" step="1" value="${esc(state.customStart)}" ${state.selectedPreset === 'custom' ? '' : 'readonly aria-readonly="true" style="pointer-events:none"'}>
                         </span>
                     </label>
                     <label class="bftd-fws-date-card">
-                        <span class="bftd-fws-date-label"><span>END DATE / TIME</span><span>📅</span></span>
+                        <span class="bftd-fws-date-label"><span>END DATE / TIME</span><span>${state.selectedPreset === 'custom' ? '📅' : '🕒'}</span></span>
                         <span class="bftd-fws-date-input-row">
-                            <input id="bftd-fws-custom-end" class="bftd-fws-input" type="datetime-local" step="1" value="${esc(state.customEnd)}" ${state.customStart ? `min="${esc(state.customStart)}"` : ''} ${customMaxEnd ? `max="${esc(localDateTimeInputValue(customMaxEnd))}"` : ''} ${state.scanRunning ? 'disabled' : ''}>
-                            <button type="button" class="bftd-fws-picker-btn" data-picker="end" title="Open end calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
+                            <input id="bftd-fws-custom-end" class="bftd-fws-input" type="datetime-local" step="1" value="${esc(state.customEnd)}" ${state.selectedPreset === 'custom' ? '' : 'readonly aria-readonly="true" style="pointer-events:none"'}>
                         </span>
                     </label>
                 </div>
                 <div class="bftd-fws-note" style="margin-top:6px">
-                    Manually changing the start date/time automatically sets the end to exactly <b>12 months later</b>. You can then change the end to any later date/time up to exactly <b>60 months / 5 years</b> after the start.
+                    ${state.selectedPreset === 'custom'
+                        ? 'Custom Scans can use any Start/End range up to <b>60 calendar months (5 years)</b>, ending no later than now. They read through the Master Cache but never write new Custom Scan data into it.'
+                        : 'Rolling scans are limited to the <b>most recent 12 months</b>. Selecting a preset refreshes End to now and sets Start exactly that many calendar months back. Starting a rolling scan refreshes the range to now again.'}
                 </div>
                 ${!customValidation.valid && (state.customStart || state.customEnd) ? `<div class="bftd-fws-error" style="margin-top:8px">${esc(customValidation.message)}</div>` : ''}
+                <div class="bftd-fws-card" style="margin-top:8px;padding:9px 10px">
+                    <label class="bftd-fws-row" style="cursor:${state.scanRunning ? 'default' : 'pointer'};align-items:flex-start">
+                        <input id="bftd-fws-detailed-war-data" type="checkbox" ${state.detailedWarData ? 'checked' : ''} ${state.scanRunning ? 'disabled' : ''} style="margin:2px 2px 0 0;transform:scale(1.2);accent-color:var(--bftd-accent)">
+                        <span class="bftd-fws-grow">
+                            <b>DETAILED WAR DATA</b><br>
+                            <span class="bftd-fws-note">${state.detailedWarData ? 'ON — full outgoing attack history is read for assists, outside hits, retals, overseas/group hits and detailed outcomes.' : 'OFF — Basic/Fast war mode uses ranked-war reports only for war-hit totals and skips the attack-history stage.'}</span>
+                        </span>
+                    </label>
+                    <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ DETAILED WAR DATA MAY ADD TIME:</b> Enabling this option can add extra API pages and may make the scan take longer, especially across larger periods. Leave it unticked for the faster RWPH-style Basic war calculation.</div>
+                </div>
                 <div class="bftd-fws-card" style="margin-top:8px;padding:9px 10px">
                     <label class="bftd-fws-row" style="cursor:${state.scanRunning ? 'default' : 'pointer'};align-items:flex-start">
                         <input id="bftd-fws-include-chains" type="checkbox" ${state.includeChains ? 'checked' : ''} ${state.scanRunning ? 'disabled' : ''} style="margin:2px 2px 0 0;transform:scale(1.2);accent-color:var(--bftd-accent)">
@@ -2820,9 +3081,12 @@
                     <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Each uncached completed chain report is loaded one-by-one with a minimum <b>2-second</b> gap. Reports already stored in the Master Data Cache are reused without another chain-report API call.</div>
                 </div>
                 <div class="bftd-fws-note" style="margin-top:7px">
-                    The scan first checks the Master Data Cache for the complete selected Start/End range. It loads all cached data inside that period, requests only missing coverage, writes the new records into the Master Cache, then builds the finished scan from the Master Cache across the full period. Ranked wars are processed first, followed by attacks.${state.includeChains ? ' Completed chains are then loaded and each missing chain report is fetched accurately one-by-one at the 2-second report pace.' : ' Chain scanning is currently <b>OFF</b>.'} Completed OCs and faction-armory Xanax actions follow. Every successful exact range is also saved as a disposable quick-reload snapshot.
+                    ${state.selectedPreset === 'custom'
+                        ? `Custom Scan first reads every matching record already available in the Master Data Cache, then requests only missing coverage/report IDs into a <b>temporary scan overlay</b>. The completed result is built from Master Cache data + that temporary data, but none of the newly downloaded Custom Scan data is written back to Master. Ranked wars are processed first.${state.detailedWarData ? ' Detailed War Data is <b>ON</b>, so missing outgoing attack-history coverage is loaded next.' : ' Detailed War Data is <b>OFF</b>, so the outgoing attack-history stage is skipped and war hits come from ranked-war reports only.'}${state.includeChains ? ' Missing chain reports are fetched accurately one-by-one at the 2-second report pace into the temporary overlay.' : ' Chain scanning is currently <b>OFF</b>.'} Completed OCs and faction-armory Xanax actions follow.`
+                        : `The scan first checks the Master Data Cache for the complete selected Start/End range. It loads all cached data inside that period, requests only missing coverage, writes the new records into the Master Cache, then builds the finished scan from the Master Cache across the full period. Ranked wars are processed first.${state.detailedWarData ? ' Detailed War Data is <b>ON</b>, so missing outgoing attack-history coverage is loaded next.' : ' Detailed War Data is <b>OFF</b>, so the outgoing attack-history stage is skipped and war hits come from ranked-war reports only.'}${state.includeChains ? ' Completed chains are then loaded and each missing chain report is fetched accurately one-by-one at the 2-second report pace.' : ' Chain scanning is currently <b>OFF</b>.'} Completed OCs and faction-armory Xanax actions follow.`}
+                    Every successful exact range is also saved as a disposable quick-reload snapshot.
                 </div>
-                <div class="bftd-fws-ok" style="margin-top:8px"><b>MASTER DATA CACHE:</b> Ranked-war history/reports, attacks, completed chain lists/reports, completed OCs and armory logs accumulate in one reusable local browser cache. Before every scan, Faction Helper checks the full selected Start/End range against this master data first. Each stage then requests only uncovered intervals and reads every covered interval locally. Separate quick-reload scan snapshots can be deleted without removing the master history.</div>
+                <div class="bftd-fws-ok" style="margin-top:8px"><b>ROLLING 12-MONTH MASTER DATA CACHE:</b> Ranked-war history/reports, attacks, completed chain lists/reports, completed OCs and armory logs accumulate in one reusable local browser cache covering only the rolling most recent 12 months. Before every scan, Faction Helper prunes expired data, checks the selected range against the remaining master data, requests only uncovered intervals/report IDs, and then rebuilds the result from the Master Cache. Separate quick-reload snapshots can be deleted without removing master history. <b>Custom Scans may read this cache but never add their downloaded data to it.</b></div>
                 <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The first scan of a large uncached period can still take significantly longer. Once that history is cached locally, overlapping scans should need far fewer Torn API calls.</div>
                 <div class="bftd-fws-scanstatus">
                     <div class="bftd-fws-grow bftd-fws-note"><b>${esc(scanStatus)}</b>${scannedRange ? `<br>${esc(dateTime(scannedRange.from))} → ${esc(dateTime(scannedRange.to))}` : ''}</div>
@@ -2860,49 +3124,41 @@
             });
         });
 
-        const customStartInput = body.querySelector('#bftd-fws-custom-start');
-        const customEndInput = body.querySelector('#bftd-fws-custom-end');
-        body.querySelectorAll('[data-picker]').forEach(btn => {
-            btn.addEventListener('click', event => {
-                event.preventDefault();
-                event.stopPropagation();
-                const target = btn.dataset.picker === 'end' ? customEndInput : customStartInput;
-                if (!target || target.disabled) return;
-                try {
-                    if (typeof target.showPicker === 'function') target.showPicker();
-                    else { target.focus(); target.click(); }
-                } catch {
-                    target.focus();
-                }
+        body.querySelector('#bftd-fws-custom-mode')?.addEventListener('click', () => {
+            activateCustomRange();
+            state.currentMember = null;
+            document.getElementById('bftd-fws-stats')?.remove();
+            state.statsPanel = null;
+            state.scanError = '';
+            state.shareMessage = '';
+            state.shareMessageType = '';
+            renderMain();
+        });
+        for (const selector of ['#bftd-fws-custom-start', '#bftd-fws-custom-end']) {
+            body.querySelector(selector)?.addEventListener('change', event => {
+                if (state.selectedPreset !== 'custom') return;
+                if (selector.endsWith('start')) state.customStart = event.target.value;
+                else state.customEnd = event.target.value;
+                state.currentMember = null;
+                document.getElementById('bftd-fws-stats')?.remove();
+                state.statsPanel = null;
+                state.scanError = '';
+                state.shareMessage = '';
+                state.shareMessageType = '';
+                renderMain();
+                if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
             });
-        });
-        customStartInput?.addEventListener('change', () => {
-            state.customStart = customStartInput.value;
-            const startDate = parseLocalDateTimeInput(state.customStart);
-            state.customEnd = startDate ? localDateTimeInputValue(addCalendarMonthsClamped(startDate, 12)) : '';
-            state.currentMember = null;
-            document.getElementById('bftd-fws-stats')?.remove();
-            state.statsPanel = null;
-            state.scanError = '';
-            state.shareMessage = '';
-            state.shareMessageType = '';
-            renderMain();
-            if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
-        });
-        customEndInput?.addEventListener('change', () => {
-            state.customEnd = customEndInput.value;
-            state.currentMember = null;
-            document.getElementById('bftd-fws-stats')?.remove();
-            state.statsPanel = null;
-            state.scanError = '';
-            state.shareMessage = '';
-            state.shareMessageType = '';
-            renderMain();
-            if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
-        });
+        }
 
         body.querySelector('#bftd-fws-scan')?.addEventListener('click', () => runFactionScan(true));
         body.querySelector('#bftd-fws-cancel-main-scan')?.addEventListener('click', () => { state.abortScan = true; });
+        body.querySelector('#bftd-fws-detailed-war-data')?.addEventListener('change', event => {
+            state.detailedWarData = Boolean(event.target.checked);
+            GM_setValue(APP.detailedWarDataStorage, state.detailedWarData);
+            state.shareMessage = '';
+            state.shareMessageType = '';
+            renderMain();
+        });
         body.querySelector('#bftd-fws-include-chains')?.addEventListener('change', event => {
             state.includeChains = Boolean(event.target.checked);
             GM_setValue(APP.includeChainsStorage, state.includeChains);
@@ -2931,6 +3187,7 @@
         const panel = document.getElementById('bftd-fws-cache');
         const body = panel?.querySelector('.bftd-fws-body');
         if (!body) return;
+        await pruneMasterCacheToRollingWindow();
         const scans = getLocalCachedScans();
         body.innerHTML = '<div class="bftd-fws-note">Loading local cache information…</div>';
 
@@ -2943,8 +3200,8 @@
             <div class="bftd-fws-card">
                 <div class="bftd-fws-row" style="align-items:flex-start">
                     <div class="bftd-fws-grow">
-                        <div style="font-weight:800">MASTER DATA CACHE</div>
-                        <div class="bftd-fws-note" style="margin-top:4px">This is the permanent reusable faction-history cache. New scans add/update raw data and permanent war/chain reports here, and future overlapping scans pull from it before requesting Torn. Deleting a quick scan below does not remove this data.</div>
+                        <div style="font-weight:800">ROLLING 12-MONTH MASTER DATA CACHE</div>
+                        <div class="bftd-fws-note" style="margin-top:4px">This is the rolling reusable faction-history cache. It keeps only the most recent 12 calendar months. Each new scan reuses everything still inside that window, adds only missing newer data, and automatically removes records that have rolled past the 12-month cutoff. Deleting a quick scan below does not remove this master data.</div>
                     </div>
                     <div class="bftd-fws-row wrap" style="justify-content:flex-end">
                         <button class="bftd-fws-btn secondary" id="bftd-fws-download-master-cache" ${masterTotal ? '' : 'disabled'}>DOWNLOAD MASTER</button>
@@ -2983,7 +3240,7 @@
                             <button class="bftd-fws-btn danger" data-delete-cache="${index}">DELETE</button>
                         </div>
                         <div class="bftd-fws-note" style="margin-top:7px">
-                            Saved ${esc(generated)} • ${fmt(row.warSummary?.warCount || 0)} war(s) • Chains: ${esc(chains)} • Scan time: ${esc(duration)}${row.importedAt ? ` • Imported ${esc(new Date(row.importedAt).toLocaleString())}` : ''}
+                            Saved ${esc(generated)} • ${row.scanMode === 'custom' || row.range?.code === 'custom' ? '<b>Custom Scan</b> • ' : ''}${fmt(row.warSummary?.warCount || 0)} war(s) • War data: ${row.detailedWarDataIncluded === false ? 'Basic/Fast' : 'Detailed'} • Chains: ${esc(chains)} • Scan time: ${esc(duration)}${row.importedAt ? ` • Imported ${esc(new Date(row.importedAt).toLocaleString())}` : ''}
                         </div>
                     </div>
                 `;
@@ -2995,9 +3252,21 @@
                 const row = scans[Number(btn.dataset.loadCache)];
                 const range = row?.range;
                 if (!range?.from || !range?.to) return;
+                if (num(range.to) > Math.floor(Date.now() / 1000) + 5) {
+                    state.shareMessage = 'That quick scan ends in the future and cannot be loaded.';
+                    state.shareMessageType = 'error';
+                    renderMain();
+                    return;
+                }
                 state.customStart = localDateTimeInputValue(range.from * 1000);
                 state.customEnd = localDateTimeInputValue(range.to * 1000);
-                state.selectedPreset = 'custom';
+                const savedMode = row?.scanMode || range?.code;
+                if (savedMode === 'custom') {
+                    state.selectedPreset = 'custom';
+                } else {
+                    state.selectedMonths = inferPresetMonths(range);
+                    state.selectedPreset = 'rolling';
+                }
                 state.currentMember = null;
                 document.getElementById('bftd-fws-stats')?.remove();
                 state.statsPanel = null;
@@ -3089,6 +3358,8 @@
 
     async function runFactionScan(forceRefresh = true) {
         if (state.scanRunning) return;
+        const customScan = state.selectedPreset === 'custom';
+        if (!customScan) applyQuickRange(state.selectedMonths || 6);
         const range = getPresetRange();
         if (!range.valid) {
             state.scanError = range.validationMessage || 'Choose a valid start and end date/time first.';
@@ -3097,7 +3368,9 @@
         }
 
         const includeChains = Boolean(state.includeChains);
-        const totalStages = includeChains ? 5 : 4;
+        const detailedWarData = Boolean(state.detailedWarData);
+        const totalStages = 3 + (detailedWarData ? 1 : 0) + (includeChains ? 1 : 0);
+        state.masterWindowAnchorTo = customScan ? 0 : Math.floor(num(range.to));
         state.scanRunning = true;
         let scanSucceeded = false;
         const scanStartedAt = Date.now();
@@ -3109,10 +3382,28 @@
         renderMain();
 
         try {
-            setScanProgress('Checking Master Data Cache…', 'Loading every cached record already available inside the complete selected Start/End range before any historical Torn requests are made.');
+            setScanProgress('Maintaining rolling 12-month Master Data Cache…', customScan
+                ? 'Custom Scan is read-only against Master Data. Expired master records are pruned to keep Master limited to the rolling last 12 months, but this Custom Scan will not add anything new to Master.'
+                : 'Removing master records and coverage older than exactly 12 calendar months from the current date/time before planning this scan.');
+            const pruneInfo = await pruneMasterCacheToRollingWindow();
+
+            if (customScan) state.transientHistory = createTransientHistory(range);
+
+            if (detailedWarData && !customScan) {
+                const resetOldAttackCache = await ensureDetailedAttackHistorySchema();
+                if (resetOldAttackCache) {
+                    setScanProgress('Refreshing old detailed attack cache…', 'Faction Helper found pre-v1.7.9 attack records that do not contain Torn\'s ranked-war flag/start timestamp. Only the attack-history portion was cleared so it can be rebuilt correctly; all other Master Data was preserved.');
+                }
+            }
+
+            setScanProgress(customScan ? 'Checking Master Data + temporary Custom Scan gaps…' : 'Checking Master Data Cache…',
+                customScan
+                    ? `Rolling master window: ${dateTime(pruneInfo.from)} → ${dateTime(pruneInfo.to)}. Reusing any Master Data that overlaps ${dateTime(range.from)} → ${dateTime(range.to)}; missing data will be downloaded into temporary memory only.`
+                    : `Rolling master window: ${dateTime(pruneInfo.from)} → ${dateTime(pruneInfo.to)} • ${pruneInfo.deletedRecords || 0} expired record(s) removed. Loading all cached data already available inside the selected range before any historical Torn requests are made.`);
             const cachePlan = await buildMasterCacheScanPlan(range);
+            if (!detailedWarData) cachePlan.attacks = [];
             if (!includeChains) cachePlan.chains = [];
-            setScanProgress('Master Data Cache checked', `${scanPlanSummary(cachePlan)}${includeChains ? '' : ' • chains: skipped'}. Only uncovered intervals and missing permanent report IDs will be requested from Torn.`);
+            setScanProgress(customScan ? 'Master Data checked — Custom downloads stay temporary' : 'Master Data Cache checked', `${scanPlanSummary(cachePlan)}${detailedWarData ? '' : ' • attacks: skipped (Basic/Fast war mode)'}${includeChains ? '' : ' • chains: skipped'}. Only uncovered intervals and missing report IDs will be requested from Torn.${customScan ? ' Newly downloaded Custom Scan data will NOT be written to Master.' : ''}`);
 
             setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `Using Master Data Cache first • ${cachePlan.wars.length} uncovered war-history range(s). Completed war reports are cached permanently by war ID.`);
             const warScan = await scanRankedWarsAndReports(range, (done, total, apiCalls, cacheHits) => {
@@ -3120,13 +3411,19 @@
             }, cachePlan.wars);
 
             let stage = 2;
-            if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning all faction attacks…`, 'Loading only attack-history gaps not already covered by the Master Data Cache. The finished attack dataset is then rebuilt from the Master Cache for the full selected period.');
-            const attackStage = stage;
-            const attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks, missingRanges, currentRange, cacheReuse) => {
-                setScanProgress(`${attackStage}/${totalStages} — Scanning all faction attacks…`, `${pages} new API page(s) • ${attacks} attack record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
-            }, cachePlan.attacks);
-            stage += 1;
+            let attackScan;
+            if (detailedWarData) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                setScanProgress(`${stage}/${totalStages} — Scanning detailed faction attacks…`, customScan ? 'Detailed War Data is ON. Reusing matching Master attacks and downloading only missing attack-history gaps into temporary Custom Scan memory.' : 'Detailed War Data is ON. Loading only attack-history gaps not already covered by the Master Data Cache, then rebuilding the full selected-period attack dataset from master history.');
+                const attackStage = stage;
+                attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks, missingRanges, currentRange, cacheReuse) => {
+                    setScanProgress(`${attackStage}/${totalStages} — Scanning detailed faction attacks…`, `${pages} new API page(s) • ${attacks} attack record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
+                }, cachePlan.attacks);
+                stage += 1;
+            } else {
+                attackScan = buildBasicFastWarScan(warScan.wars, warScan.reportStats);
+                setScanProgress(`Basic/Fast war data ready`, `Attack-history API stage skipped. ${attackScan.fetchedCount || 0} ranked-war report attack(s) were used as war hits; assists, outside hits, retals, overseas/group hits and detailed attack outcomes were not read.`);
+            }
 
             let chainScan = { chains: [], historyPages: 0, apiChainsSeen: 0, cacheCount: 0, missingRangesFetched: 0, reportApiCalls: 0, reportCacheHits: 0, summary: null };
             let chainSummary = null;
@@ -3146,7 +3443,7 @@
             }
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning completed organized crimes…`, 'Loading only OC-history gaps, writing them into the Master Cache, then rebuilding the full selected period from master data.');
+            setScanProgress(`${stage}/${totalStages} — Scanning completed organized crimes…`, customScan ? 'Reusing matching Master OC data and downloading only missing OC-history gaps into temporary Custom Scan memory.' : 'Loading only OC-history gaps, writing them into the Master Cache, then rebuilding the full selected period from master data.');
             const ocStage = stage;
             const ocScan = await scanFactionCrimes(range, (pages, crimes, cacheReuse, missingRanges, currentRange) => {
                 setScanProgress(`${ocStage}/${totalStages} — Scanning completed organized crimes…`, `${pages} new OC API page(s) • ${crimes} completed OC record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
@@ -3154,16 +3451,18 @@
             stage += 1;
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning faction armory Xanax…`, 'Loading only armory-history gaps, writing them into the Master Cache, then rebuilding the full selected period from master data.');
+            setScanProgress(`${stage}/${totalStages} — Scanning faction armory Xanax…`, customScan ? 'Reusing matching Master armory data and downloading only missing armory-history gaps into temporary Custom Scan memory.' : 'Loading only armory-history gaps, writing them into the Master Cache, then rebuilding the full selected period from master data.');
             const armoryStage = stage;
             const armoryScan = await scanFactionArmoryXanax(range, (pages, newsCount, cacheReuse, missingRanges, currentRange) => {
                 setScanProgress(`${armoryStage}/${totalStages} — Scanning faction armory Xanax…`, `${pages} new armory API page(s) • ${newsCount} record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
             }, cachePlan.armory);
 
-            // Every historical stage above writes new information into IndexedDB first and
-            // then returns calculations made from the Master Data Cache. Quick scan snapshots
-            // below are only disposable precomputed views of that master data.
-            setScanProgress('Building finished scan from Master Data Cache…', 'All newly fetched data is stored. Building the complete selected Start/End result from the combined cached history.');
+            // Rolling scans build from the persistent Master Cache. Custom scans use a
+            // read-through in-memory overlay for any data missing from Master.
+            setScanProgress(customScan ? 'Building finished Custom Scan…' : 'Building finished scan from Master Data Cache…',
+                customScan
+                    ? 'Building the complete selected Start/End result from reusable Master Data plus the temporary Custom Scan overlay. Temporary downloads will be discarded after the quick-reload snapshot is saved.'
+                    : 'All newly fetched data is stored. Building the complete selected Start/End result from the combined cached history.');
 
             const warSummary = {
                 warCount: warScan.wars.length,
@@ -3197,8 +3496,11 @@
                 armoryScan.newsCount,
                 Date.now() - scanStartedAt,
                 includeChains,
+                detailedWarData,
                 {
-                    attacks: { apiPages: attackScan.pageCount, apiFetched: attackScan.apiFetchedCount, reused: attackScan.cacheReuseCount, missingRanges: attackScan.missingRangeCount },
+                    attacks: detailedWarData
+                        ? { apiPages: attackScan.pageCount, apiFetched: attackScan.apiFetchedCount, reused: attackScan.cacheReuseCount, missingRanges: attackScan.missingRangeCount, skipped: false }
+                        : { apiPages: 0, apiFetched: 0, reused: 0, missingRanges: 0, skipped: true },
                     crimes: { apiPages: ocScan.pageCount, apiFetched: ocScan.apiFetchedCount, reused: ocScan.cacheReuseCount, missingRanges: ocScan.missingRangeCount },
                     armory: { apiPages: armoryScan.pageCount, apiFetched: armoryScan.apiFetchedCount, reused: armoryScan.cacheReuseCount, missingRanges: armoryScan.missingRangeCount },
                     chains: includeChains ? {
@@ -3211,16 +3513,20 @@
                     } : null
                 }
             );
-            await touchMasterCache(range, {
-                chainsIncluded: includeChains,
-                scanDurationMs: Date.now() - scanStartedAt
-            });
+            if (!customScan) {
+                await touchMasterCache(range, {
+                    chainsIncluded: includeChains,
+                    detailedWarDataIncluded: detailedWarData,
+                    scanDurationMs: Date.now() - scanStartedAt
+                });
+                await pruneMasterCacheToRollingWindow();
+            }
             if (document.getElementById('bftd-fws-cache')) renderCachedScansPanel();
 
             const completedIn = formatScanDuration(Date.now() - scanStartedAt);
             const historyPagesFetched = num(attackScan.pageCount) + num(ocScan.pageCount) + num(armoryScan.pageCount) + (includeChains ? num(chainScan.historyPages) : 0);
             const historyRecordsReused = num(attackScan.cacheReuseCount) + num(ocScan.cacheReuseCount) + num(armoryScan.cacheReuseCount);
-            state.shareMessage = `Scan completed in ${completedIn}${includeChains ? ` with chains • ${num(chainScan.reportApiCalls)} new chain report call(s) • ${num(chainScan.reportCacheHits)} chain report(s) reused` : ' without chains'} • ${historyPagesFetched} new history API page(s) • ${historyRecordsReused} cached record(s) reused.`;
+            state.shareMessage = `${customScan ? 'Custom scan' : 'Scan'} completed in ${completedIn} • ${detailedWarData ? 'Detailed war data' : 'Basic/Fast war data'}${includeChains ? ` • chains included • ${num(chainScan.reportApiCalls)} new chain report call(s) • ${num(chainScan.reportCacheHits)} chain report(s) reused` : ' • chains not included'} • ${historyPagesFetched} new history API page(s) • ${historyRecordsReused} cached record(s) reused${customScan ? ' • Custom downloads were temporary and Master Data was not updated' : ''}.`;
             state.shareMessageType = '';
             state.lastAggregates = attackScan.aggregates;
             state.lastOcAggregates = ocScan.aggregates;
@@ -3233,6 +3539,8 @@
         } finally {
             state.scanRunning = false;
             state.abortScan = false;
+            state.masterWindowAnchorTo = 0;
+            state.transientHistory = null;
             renderMain();
             if (scanSucceeded) openMemberListPanel();
             else if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
@@ -3355,6 +3663,7 @@
             armoryNewsCount: cached.armoryNewsCount,
             warSummary: cached.warSummary,
             chainSummary: cached.chainSummary || null,
+            detailedWarDataIncluded: cached.detailedWarDataIncluded !== false,
             historyCacheStats: cached.historyCacheStats || null,
             memberSnapshot: Array.isArray(cached.membersSnapshot) && cached.membersSnapshot.length > 0
         });
@@ -3411,6 +3720,7 @@
             const from = Math.floor(num(row.range.from));
             const to = Math.floor(num(row.range.to));
             if (!from || !to || to <= from) continue;
+            if (to > Math.floor(Date.now() / 1000) + 5) continue;
             const id = `${from}:${to}`;
             const prev = byRange.get(id);
             if (!prev || num(row.generatedAt) > num(prev.generatedAt)) byRange.set(id, row);
@@ -3425,12 +3735,12 @@
             if (!key.startsWith(factionPrefix)) continue;
             if (cacheEntryMatchesRange(row, range)) delete store[key];
         }
-        const normalizedRange = { ...(entry?.range || range), code:'custom', label:'Selected time period', from:Math.floor(num(range.from)), to:Math.floor(num(range.to)), valid:true };
+        const normalizedRange = { ...(entry?.range || range), code:(range?.code === 'custom' ? 'custom' : 'rolling'), label:(range?.code === 'custom' ? 'Custom Scan' : 'Selected time period'), from:Math.floor(num(range.from)), to:Math.floor(num(range.to)), valid:true, custom:range?.code === 'custom' };
         store[cacheKey(normalizedRange)] = { ...entry, range: normalizedRange };
         saveCacheStore(store);
     }
 
-    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0, chainsIncluded = false, historyCacheStats = null) {
+    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0, chainsIncluded = false, detailedWarDataIncluded = true, historyCacheStats = null) {
         savePeriodCacheEntry(range, {
             generatedAt: Date.now(),
             range,
@@ -3440,6 +3750,8 @@
             warSummary,
             chainSummary,
             chainsIncluded: Boolean(chainsIncluded),
+            detailedWarDataIncluded: Boolean(detailedWarDataIncluded),
+            scanMode: range?.code === 'custom' ? 'custom' : 'rolling',
             pageCount,
             fetchedCount,
             ocPageCount,
@@ -3495,10 +3807,12 @@
 
         // Keep a compatibility mirror so a temporary downgrade can still reopen
         // recent reports. The master IndexedDB cache is the authoritative source.
-        const store = loadWarReportCache();
-        store[String(warId)] = report;
-        const compact = Object.fromEntries(Object.entries(store).slice(-1000));
-        GM_setValue(APP.warReportCacheStorage, JSON.stringify(compact));
+        if (!state.transientHistory) {
+            const store = loadWarReportCache();
+            store[String(warId)] = report;
+            const compact = Object.fromEntries(Object.entries(store).slice(-1000));
+            GM_setValue(APP.warReportCacheStorage, JSON.stringify(compact));
+        }
     }
 
     function extractChains(payload) {
@@ -3778,6 +4092,11 @@
         return factions.find(f => Number(f?.id) === Number(state.faction?.id)) || null;
     }
 
+    function reportOpponentFaction(report) {
+        const factions = Array.isArray(report?.factions) ? report.factions : Object.values(report?.factions || {});
+        return factions.find(f => Number(f?.id) !== Number(state.faction?.id)) || null;
+    }
+
     function freshReportStat() {
         return { reportAttacks: 0, warScore: 0, wars: {} };
     }
@@ -3861,6 +4180,12 @@
             }
 
             if (report) {
+                const reportOpponent = reportOpponentFaction(report);
+                if (reportOpponent?.id && (!war.opponentId || Number(war.opponentId) !== Number(reportOpponent.id))) {
+                    war.opponentId = num(reportOpponent.id, 0);
+                    war.opponentName = String(reportOpponent.name || `Faction ${reportOpponent.id}`);
+                    await historyPutRecords('wars', [war], row => row.id, row => row.start);
+                }
                 const own = reportOwnFaction(report);
                 const members = Array.isArray(own?.members) ? own.members : Object.values(own?.members || {});
                 for (const member of members) {
@@ -3971,6 +4296,52 @@
         }
     }
 
+
+    function buildBasicFastWarScan(wars, reportStats) {
+        const aggregates = {};
+        applyReportStats(aggregates, wars, reportStats);
+        let totalReportAttacks = 0;
+
+        for (const member of state.members) {
+            const uid = Number(member.id);
+            if (!aggregates[uid]) aggregates[uid] = freshAgg();
+        }
+
+        for (const s of Object.values(aggregates)) {
+            let warHits = 0;
+            let warsWithHits = 0;
+            for (const row of Object.values(s.warBreakdown || {})) {
+                const hits = Math.max(0, num(row.reportAttacks, 0));
+                row.warHits = hits;
+                row.warAttempts = hits;
+                row.warAssists = 0;
+                row.warRetals = 0;
+                row.outsideHits = 0;
+                row.outsideAssists = 0;
+                row.outsideRetals = 0;
+                warHits += hits;
+                if (hits > 0) warsWithHits += 1;
+            }
+            s.warHits = warHits;
+            s.warAttempts = warHits;
+            s.warsWithWarHits = warsWithHits;
+            // Basic/Fast mode intentionally does not populate assists, outside-hit
+            // classifications, retals, overseas/group modifiers or general attack outcomes.
+            totalReportAttacks += warHits;
+        }
+
+        return {
+            aggregates,
+            pageCount: 0,
+            fetchedCount: totalReportAttacks,
+            apiFetchedCount: 0,
+            cacheReuseCount: 0,
+            missingRangeCount: 0,
+            attacks: [],
+            skippedDetailedAttacks: true
+        };
+    }
+
     function attackId(attack, fallback) {
         return String(attack?.id ?? attack?.attack_id ?? fallback ?? '');
     }
@@ -3992,8 +4363,27 @@
         );
     }
 
+    function attackStartedTs(attack) {
+        return num(attack?.started ?? attack?.timestamp_started ?? attack?.start ?? attack?.timestamp ?? 0);
+    }
+
     function attackEndTs(attack) {
         return num(attack?.ended ?? attack?.timestamp_ended ?? attack?.end ?? attack?.timestamp ?? 0);
+    }
+
+    function attackerFactionId(attack) {
+        return num(
+            attack?.attacker?.faction?.id
+            ?? attack?.attacker?.faction_id
+            ?? attack?.attacker_faction_id
+            ?? 0
+        );
+    }
+
+    function attackIsRankedWar(attack) {
+        return attack?.is_ranked_war === true
+            || attack?.is_ranked_war === 1
+            || String(attack?.is_ranked_war || '').toLowerCase() === 'true';
     }
 
     function attackResult(attack) {
@@ -4005,11 +4395,50 @@
         return wars.find(w => ts >= w.start && ts <= (w.end || Number.MAX_SAFE_INTEGER)) || null;
     }
 
-    function targetWarForAttack(ts, defenderFaction, wars) {
-        if (!ts || !defenderFaction) return null;
-        return wars.find(w => Number(w.opponentId) === Number(defenderFaction)
-            && ts >= w.start
-            && ts <= (w.end || Number.MAX_SAFE_INTEGER)) || null;
+    function attackOverlapsWar(attack, war, toleranceSeconds = 5) {
+        const started = attackStartedTs(attack) || attackEndTs(attack);
+        const ended = attackEndTs(attack) || started;
+        if (!started || !war?.start) return false;
+        const warEnd = num(war.end) || Number.MAX_SAFE_INTEGER;
+        return started <= warEnd + toleranceSeconds && ended >= num(war.start) - toleranceSeconds;
+    }
+
+    function targetWarForAttack(attack, wars) {
+        const defenderFaction = defenderFactionId(attack);
+        const ts = attackEndTs(attack) || attackStartedTs(attack);
+        if (!ts) return null;
+
+        // Primary match: exact RW opponent + attack interval overlap. Using the
+        // full attack interval handles Torn's documented final-hit edge case where
+        // the attack starts before the war end but its `ended` timestamp is later.
+        if (defenderFaction) {
+            const exact = wars.find(w => Number(w.opponentId) === Number(defenderFaction) && attackOverlapsWar(attack, w));
+            if (exact) return exact;
+        }
+
+        // Torn's is_ranked_war flag / war modifier is authoritative for the hit
+        // classification. If opponent metadata is incomplete, associate it with the
+        // one overlapping ranked war rather than dropping the hit completely.
+        const warFlag = attackIsRankedWar(attack) || num(attack?.modifiers?.war, 1) > 1.00001;
+        if (warFlag) {
+            const overlapping = wars.filter(w => attackOverlapsWar(attack, w));
+            if (overlapping.length === 1) return overlapping[0];
+            if (defenderFaction) {
+                const sameOpponent = wars
+                    .filter(w => Number(w.opponentId) === Number(defenderFaction))
+                    .sort((a, b) => {
+                        const dist = w => {
+                            const start = num(w.start);
+                            const end = num(w.end) || start;
+                            if (ts >= start && ts <= end) return 0;
+                            return Math.min(Math.abs(ts - start), Math.abs(ts - end));
+                        };
+                        return dist(a) - dist(b);
+                    })[0];
+                if (sameOpponent) return sameOpponent;
+            }
+        }
+        return null;
     }
 
     function incrementOutcome(map, resultRaw) {
@@ -4023,11 +4452,9 @@
         if (!aggregates[aid]) aggregates[aid] = freshAgg();
         const s = aggregates[aid];
 
-        const ts = attackEndTs(attack);
-        const defenderFaction = defenderFactionId(attack);
-        const targetWar = targetWarForAttack(ts, defenderFaction, wars);
+        const ts = attackEndTs(attack) || attackStartedTs(attack);
+        const targetWar = targetWarForAttack(attack, wars);
         const activeWar = activeWarAt(ts, wars);
-        const context = targetWar ? 'war' : (activeWar ? 'duringWar' : 'outsideWar');
 
         const resultRaw = attackResult(attack);
         const result = resultRaw.toLowerCase();
@@ -4037,6 +4464,9 @@
         const assist = result === 'assist';
         const success = !assist && !interrupted && (SUCCESS_RESULTS.has(result) || (respectGain > 0 && !FAILURE_RESULTS.has(result)));
         const retal = num(attack?.modifiers?.retaliation, 1) > 1.00001;
+        const rankedWarFlag = attackIsRankedWar(attack) || num(attack?.modifiers?.war, 1) > 1.00001;
+        const isWarTarget = Boolean(targetWar) || rankedWarFlag;
+        const context = isWarTarget ? 'war' : (activeWar ? 'duringWar' : 'outsideWar');
 
         s.totalAttempts += 1;
         s.respect += respectGain;
@@ -4062,19 +4492,23 @@
             if (num(attack?.modifiers?.overseas, 1) > 1.00001) s.overseasHits += 1;
         }
 
-        if (targetWar) {
-            const row = ensureWarBreakdown(s, targetWar);
-            row.warAttempts += 1;
+        if (isWarTarget) {
+            // RWPH Advanced precedence: a retal on the ranked-war opponent is still
+            // a war hit and additionally receives the retal subtype. A non-war retal
+            // stays an outside hit and receives the retal subtype there.
+            const rowWar = targetWar || activeWar;
+            const row = rowWar ? ensureWarBreakdown(s, rowWar) : null;
             s.warAttempts += 1;
+            if (row) row.warAttempts += 1;
             if (assist) {
                 s.warAssists += 1;
-                row.warAssists += 1;
+                if (row) row.warAssists += 1;
             } else if (success) {
                 s.warHits += 1;
-                row.warHits += 1;
+                if (row) row.warHits += 1;
                 if (retal) {
                     s.warRetals += 1;
-                    row.warRetals += 1;
+                    if (row) row.warRetals += 1;
                 }
             }
         } else if (activeWar) {
@@ -4117,13 +4551,20 @@
         const id = attackId(attack, fallback);
         return {
             id,
+            _schema: ATTACK_HISTORY_SCHEMA_VERSION,
+            started: attackStartedTs(attack),
             ended: attackEndTs(attack),
             result: attackResult(attack),
             respect_gain: num(attack?.respect_gain ?? attack?.respect, 0),
             respect_loss: num(attack?.respect_loss, 0),
             is_interrupted: attack?.is_interrupted === true,
+            is_ranked_war: attackIsRankedWar(attack),
+            is_raid: attack?.is_raid === true,
             chain: num(attack?.chain ?? attack?.chain_count ?? attack?.chain_position, 0),
-            attacker: { id: attackerId(attack) },
+            attacker: {
+                id: attackerId(attack),
+                faction: { id: attackerFactionId(attack) }
+            },
             defender: {
                 id: defenderId(attack),
                 faction: { id: defenderFactionId(attack) }
@@ -4132,6 +4573,33 @@
                 ? { ...attack.modifiers }
                 : {}
         };
+    }
+
+    function reconcileDetailedWarHitsWithReports(aggregates, wars, reportStats) {
+        // Torn's ranked-war report is the authoritative successful war-hit count.
+        // The detailed attack log is still used for assists, outside hits, retal
+        // subtypes, overseas/group modifiers and outcomes. This mirrors RWPH
+        // Advanced and prevents a timestamp/API-flag edge case from deleting hits.
+        for (const [uidText, rs] of Object.entries(reportStats || {})) {
+            const uid = Number(uidText);
+            if (!aggregates[uid]) aggregates[uid] = freshAgg();
+            const stat = aggregates[uid];
+            for (const war of wars || []) {
+                const reportRow = rs?.wars?.[String(war.id)];
+                if (!reportRow) continue;
+                const row = ensureWarBreakdown(stat, war);
+                const expected = Math.max(0, num(reportRow.reportAttacks, 0));
+                const classified = Math.max(0, num(row.warHits, 0));
+                row.classifiedWarHits = classified;
+                row.warHitsReconciled = expected !== classified;
+                row.warHits = expected;
+            }
+        }
+
+        for (const stat of Object.values(aggregates || {})) {
+            stat.warHits = Object.values(stat.warBreakdown || {}).reduce((sum, row) => sum + Math.max(0, num(row.warHits)), 0);
+            stat.warsWithWarHits = Object.values(stat.warBreakdown || {}).filter(row => num(row.warHits) > 0).length;
+        }
     }
 
     async function scanFactionAttacks(range, wars, reportStats, onProgress, plannedMissingRanges = null) {
@@ -4231,6 +4699,8 @@
             addAttack(aggregates, attack, wars);
             if (i % 1000 === 0) onProgress?.(pageCount, allAttacks.length, missingRanges.length, missingRanges.length, cacheReuseCount);
         }
+
+        reconcileDetailedWarHitsWithReports(aggregates, wars, reportStats);
 
         for (const member of state.members) {
             const uid = Number(member.id);
@@ -4762,6 +5232,7 @@ ${clone.outerHTML}
             Math.floor(num(meta.generatedAt, Date.now()) / 1000)
         );
         const warsInFactionDisplay = warsInFaction === null ? '—' : fmt(warsInFaction);
+        const detailedWarDataIncluded = meta.detailedWarDataIncluded !== false;
         const chainSummaryAvailable = Boolean(meta.chainSummary && typeof meta.chainSummary === 'object');
         const memberChains = chainSummaryAvailable
             ? (meta.chainSummary?.memberParticipation?.[String(member.id)] || meta.chainSummary?.memberParticipation?.[Number(member.id)] || [])
@@ -4795,7 +5266,7 @@ ${clone.outerHTML}
 
         const warRows = Object.values(s.warBreakdown || {})
             .sort((a, b) => num(a.start) - num(b.start))
-            .map(w => `
+            .map(w => detailedWarDataIncluded ? `
                 <tr>
                     <td>${esc(w.opponentName || `Faction ${w.opponentId}`)}<div class="bftd-fws-note">#${esc(w.id)} • ${esc(dateTime(w.start))}</div></td>
                     <td>${fmt(w.warHits)}</td>
@@ -4805,7 +5276,13 @@ ${clone.outerHTML}
                     <td>${fmt(w.reportAttacks)}</td>
                     <td>${fmt(w.score, 2)}</td>
                 </tr>
-            `).join('') || `<tr><td colspan="7">No member activity was found in the ranked wars for this period.</td></tr>`;
+            ` : `
+                <tr>
+                    <td>${esc(w.opponentName || `Faction ${w.opponentId}`)}<div class="bftd-fws-note">#${esc(w.id)} • ${esc(dateTime(w.start))}</div></td>
+                    <td>${fmt(w.warHits)}</td>
+                    <td>${fmt(w.score, 2)}</td>
+                </tr>
+            `).join('') || `<tr><td colspan="${detailedWarDataIncluded ? 7 : 3}">No member activity was found in the ranked wars for this period.</td></tr>`;
 
         const outcomes = Object.entries(s.outcomeCounts || {})
             .sort((a, b) => b[1] - a[1])
@@ -4840,14 +5317,17 @@ ${clone.outerHTML}
                     <div class="bftd-fws-stat"><div class="v">${esc(warsInFactionDisplay)}</div><div class="k">WARS MEMBER WAS IN FACTION</div></div>
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.warsWithWarHits)}</div><div class="k">WARS WITH WAR HITS</div></div>
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.warHits)}</div><div class="k">WAR HITS</div></div>
+                    ${detailedWarDataIncluded ? `
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.warAssists)}</div><div class="k">WAR ASSISTS</div></div>
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.warRetals)}</div><div class="k">WAR RETALS</div></div>
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.warAttempts)}</div><div class="k">WAR-TARGET ATTEMPTS</div></div>
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.reportAttacks)}</div><div class="k">RW REPORT ATTACKS</div></div>
+                    ` : ''}
                     <div class="bftd-fws-stat"><div class="v">${fmt(s.warScore, 2)}</div><div class="k">RW REPORT SCORE</div></div>
                 </div>
             </div>
 
+            ${detailedWarDataIncluded ? `
             <div class="bftd-fws-card">
                 <div style="font-weight:800;margin-bottom:8px">OUTSIDE HITS DURING RANKED WARS</div>
                 <div class="bftd-fws-grid">
@@ -4891,11 +5371,19 @@ ${clone.outerHTML}
                 </div>
             </div>
 
+            ` : `
+            <div class="bftd-fws-card">
+                <div style="font-weight:800;margin-bottom:7px">BASIC / FAST WAR DATA</div>
+                <div class="bftd-fws-note">This saved scan used ranked-war reports only for war-hit totals. Assists, outside hits, retals, overseas/group modifiers, general attack outcomes and other detailed outgoing-attack classifications were intentionally not read.</div>
+            </div>
+            `}
             <div class="bftd-fws-card">
                 <div style="font-weight:800;margin-bottom:7px">WAR-BY-WAR BREAKDOWN</div>
                 <div style="overflow:auto">
-                    <table class="bftd-fws-table" style="min-width:700px">
-                        <thead><tr><th>WAR / OPPONENT</th><th>WAR HITS</th><th>ASSISTS</th><th>RETALS</th><th>OUTSIDE HITS</th><th>REPORT ATTACKS</th><th>SCORE</th></tr></thead>
+                    <table class="bftd-fws-table" style="min-width:${detailedWarDataIncluded ? '700px' : '460px'}">
+                        <thead>${detailedWarDataIncluded
+                            ? '<tr><th>WAR / OPPONENT</th><th>WAR HITS</th><th>ASSISTS</th><th>RETALS</th><th>OUTSIDE HITS</th><th>REPORT ATTACKS</th><th>SCORE</th></tr>'
+                            : '<tr><th>WAR / OPPONENT</th><th>WAR HITS</th><th>SCORE</th></tr>'}</thead>
                         <tbody>${warRows}</tbody>
                     </table>
                 </div>
@@ -4937,16 +5425,16 @@ ${clone.outerHTML}
 
             <div class="bftd-fws-card">
                 <div class="bftd-fws-note">
-                    First outgoing attack: <b>${esc(dateTime(s.firstAttackTs))}</b><br>
-                    Last outgoing attack: <b>${esc(dateTime(s.lastAttackTs))}</b><br>
+                    ${detailedWarDataIncluded ? `First outgoing attack: <b>${esc(dateTime(s.firstAttackTs))}</b><br>
+                    Last outgoing attack: <b>${esc(dateTime(s.lastAttackTs))}</b><br>` : `Detailed outgoing attack history: <b>Not scanned — Basic/Fast war mode</b><br>`}
                     First completed OC: <b>${esc(dateTime(oc.firstOcTs))}</b><br>
                     Last completed OC: <b>${esc(dateTime(oc.lastOcTs))}</b><br>
                     Xanax snapshot totals: ${xanaxLoaded ? `<b>${fmt(xanax.startTotal)}</b> → <b>${fmt(xanax.endTotal)}</b>` : '<b>Not loaded — use the button below to spend 2 API calls.</b>'}<br>
                     Faction armory Xanax: <b>${fmt(armoryXanax.used || 0)}</b> across <b>${fmt(armoryXanax.events || 0)}</b> armory log event(s)<br>
                     Ranked-war scan: <b>${fmt(meta.warSummary?.warCount || 0)}</b> wars; <b>${fmt(meta.warSummary?.historyPages || 0)}</b> history page(s); <b>${fmt(meta.warSummary?.reportApiCalls || 0)}</b> new war-report API call(s); <b>${fmt(meta.warSummary?.reportCacheHits || 0)}</b> cached war report(s)<br>
                     Chain scan: ${chainSummaryAvailable ? `<b>${fmt(meta.chainSummary?.chainCount || 0)}</b> completed chain(s); <b>${fmt(meta.chainSummary?.historyPages || 0)}</b> new chain-history API page(s); <b>${fmt(meta.chainSummary?.reportApiCalls || 0)}</b> new chain-report call(s); <b>${fmt(meta.chainSummary?.reportCacheHits || 0)}</b> chain report(s) reused from the Master Cache` : '<b>Not included in this saved scan</b>'}<br>
-                    Local history reuse: <b>${fmt(meta.historyCacheStats?.attacks?.reused || 0)}</b> attack(s), <b>${fmt(meta.historyCacheStats?.crimes?.reused || 0)}</b> OC(s), <b>${fmt(meta.historyCacheStats?.armory?.reused || 0)}</b> armory record(s)<br>
-                    Attack scan: <b>${fmt(meta.pageCount)}</b> new API page(s) / <b>${fmt(meta.fetchedCount)}</b> outgoing attacks checked<br>
+                    Local history reuse: ${detailedWarDataIncluded ? `<b>${fmt(meta.historyCacheStats?.attacks?.reused || 0)}</b> attack(s), ` : ''}<b>${fmt(meta.historyCacheStats?.crimes?.reused || 0)}</b> OC(s), <b>${fmt(meta.historyCacheStats?.armory?.reused || 0)}</b> armory record(s)<br>
+                    ${detailedWarDataIncluded ? `Attack scan: <b>${fmt(meta.pageCount)}</b> new API page(s) / <b>${fmt(meta.fetchedCount)}</b> outgoing attacks checked` : 'Attack scan: <b>Skipped — Basic/Fast war mode</b>'}<br>
                     OC scan: <b>${fmt(meta.ocPageCount)}</b> new API page(s) / <b>${fmt(meta.ocCount)}</b> completed OCs checked<br>
                     Armory scan: <b>${fmt(meta.armoryPageCount)}</b> new API page(s) / <b>${fmt(meta.armoryNewsCount)}</b> records checked<br>
                     Scan generated: <b>${esc(generatedText)}</b>
@@ -4960,7 +5448,9 @@ ${clone.outerHTML}
             </div>
 
             <div class="bftd-fws-note" style="margin-top:9px">
-                War hits are successful attacks against the ranked-war opponent inside that war's exact start/end window. War retals are included in war hits and also shown as the retal subtype. Outside hits made while a ranked war is active are kept separate from attacks made outside all ranked-war windows. RW report attacks/score come from Torn's ranked-war report and are shown separately from the detailed attack-log classification.
+                ${detailedWarDataIncluded
+                    ? "Detailed mode follows RWPH Advanced classification. Torn ranked-war report attacks are the authoritative WAR HITS total. Detailed outgoing attacks provide assists, outside hits, retal subtypes, overseas/group modifiers and outcomes. Torn's is_ranked_war flag / war modifier is preserved and used so valid war hits are not lost on war-end timestamp edge cases. War retals remain war hits plus the retal subtype; non-war retals remain outside hits plus the retal subtype."
+                    : "Basic/Fast war mode uses Torn's ranked-war report attack totals as WAR HITS. Detailed attack-history classifications such as assists, outside hits, retals, overseas/group modifiers and result breakdowns are intentionally not scanned."}
             </div>
         `;
 
