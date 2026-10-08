@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.7.0
-// @description  Faction scanner with one flexible start/end range, quick 1M/3M/6M/12M range presets, local cached scans/history, low-API chain analysis, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
+// @version      1.7.1
+// @description  Faction scanner with exact-range quick snapshots plus a persistent master local data cache, quick 1M/3M/6M/12M range presets, low-API chain analysis, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
 // @connect      api.torn.com
@@ -18,7 +18,7 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.7.0',
+        version: '1.7.1',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
@@ -235,6 +235,127 @@
         }
     }
 
+    function historyRecordKey(type, id) {
+        return `${historyFactionId()}:${type}:${String(id ?? '')}`;
+    }
+
+    async function historyGetRecordById(type, id) {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        if (!db || !factionId || id === undefined || id === null || id === '') return null;
+        try {
+            const tx = db.transaction('records', 'readonly');
+            const row = await idbRequest(tx.objectStore('records').get(historyRecordKey(type, id)));
+            return row?.data || null;
+        } catch {
+            return null;
+        }
+    }
+
+    async function historyCountType(type) {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        if (!db || !factionId) return 0;
+        try {
+            const tx = db.transaction('records', 'readonly');
+            const index = tx.objectStore('records').index('byFactionTypeTs');
+            const range = IDBKeyRange.bound(
+                [factionId, type, 0],
+                [factionId, type, Number.MAX_SAFE_INTEGER]
+            );
+            return await idbRequest(index.count(range));
+        } catch {
+            return 0;
+        }
+    }
+
+    function coverageSpanText(intervals) {
+        const rows = mergeCoverageIntervals(intervals);
+        if (!rows.length) return 'None yet';
+        const first = rows[0]?.[0];
+        const last = rows[rows.length - 1]?.[1];
+        return `${dateTime(first)} → ${dateTime(last)}${rows.length > 1 ? ` • ${rows.length} covered ranges` : ''}`;
+    }
+
+    async function getMasterCacheStats() {
+        const [attacks, wars, warReports, chains, crimes, armory, attackCoverage, warCoverage, chainCoverage, crimeCoverage, armoryCoverage, meta] = await Promise.all([
+            historyCountType('attacks'),
+            historyCountType('wars'),
+            historyCountType('warReports'),
+            historyCountType('chains'),
+            historyCountType('crimes'),
+            historyCountType('armory'),
+            historyGetCoverage('attacks'),
+            historyGetCoverage('wars'),
+            historyGetCoverage('chains'),
+            historyGetCoverage('crimes'),
+            historyGetCoverage('armory'),
+            historyGetRecordById('masterMeta', 'latest')
+        ]);
+        return {
+            attacks, wars, warReports, chains, crimes, armory,
+            attackCoverage, warCoverage, chainCoverage, crimeCoverage, armoryCoverage,
+            updatedAt: num(meta?.updatedAt),
+            completedScans: Math.max(0, num(meta?.completedScans))
+        };
+    }
+
+    async function touchMasterCache(range, extra = {}) {
+        const current = await historyGetRecordById('masterMeta', 'latest');
+        const completedScans = Math.max(0, num(current?.completedScans)) + 1;
+        const nowSec = Math.floor(Date.now() / 1000);
+        await historyPutRecords(
+            'masterMeta',
+            [{
+                id: 'latest',
+                ts: nowSec,
+                updatedAt: Date.now(),
+                completedScans,
+                lastRange: {
+                    from: Math.floor(num(range?.from)),
+                    to: Math.floor(num(range?.to))
+                },
+                chainsIncluded: Boolean(extra?.chainsIncluded),
+                lastScanDurationMs: Math.max(0, num(extra?.scanDurationMs))
+            }],
+            row => row.id,
+            row => row.ts
+        );
+    }
+
+    async function clearMasterCacheForFaction() {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        if (!db || !factionId) return;
+
+        async function clearStoreRows(storeName, shouldDelete) {
+            const tx = db.transaction(storeName, 'readwrite');
+            const store = tx.objectStore(storeName);
+            await new Promise((resolve, reject) => {
+                const request = store.openCursor();
+                request.onerror = () => reject(request.error || new Error(`Could not clear ${storeName}.`));
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return resolve();
+                    if (shouldDelete(cursor)) cursor.delete();
+                    cursor.continue();
+                };
+            });
+            await idbTransactionDone(tx);
+        }
+
+        try {
+            await clearStoreRows('records', cursor => Number(cursor.value?.factionId) === factionId);
+            await clearStoreRows('coverage', cursor => String(cursor.key || '').startsWith(`${factionId}:`));
+        } catch (err) {
+            throw new Error(`Could not clear the master data cache: ${err?.message || err}`);
+        }
+
+        // v1.7.0 and older kept completed war reports in a separate userscript value.
+        // Clear that compatibility copy as well so a deliberate master reset stays a real reset.
+        GM_setValue(APP.warReportCacheStorage, '{}');
+    }
+
     async function historyImportBundle(bundle, range) {
         if (!bundle || typeof bundle !== 'object') return;
         const from = Math.floor(num(range?.from));
@@ -242,6 +363,8 @@
         if (!from || !to || to < from) return;
         const specs = [
             ['attacks', bundle.attacks, row => row?.id, row => row?.ended],
+            ['wars', bundle.wars, row => row?.id, row => row?.start],
+            ['warReports', bundle.warReports, row => row?.id, row => row?.ts || row?.start],
             ['crimes', bundle.crimes, row => row?.id, row => row?.executed_at],
             ['armory', bundle.armory, row => row?.id, row => row?.timestamp],
             ['chains', bundle.chains, row => row?.id, row => row?.start]
@@ -251,18 +374,22 @@
             await historyPutRecords(type, rows, idGetter, tsGetter);
             if (bundle?.complete?.[type] === true) await historyMarkCoverage(type, from, to);
         }
+        await touchMasterCache(range, { chainsIncluded: Array.isArray(bundle.chains) });
     }
 
     async function historyExportBundle(range, includeChains) {
         const complete = {
             attacks: (await historyMissingRanges('attacks', range.from, range.to)).length === 0,
+            wars: (await historyMissingRanges('wars', range.from, range.to)).length === 0,
             crimes: (await historyMissingRanges('crimes', range.from, range.to)).length === 0,
             armory: (await historyMissingRanges('armory', range.from, range.to)).length === 0
         };
         const bundle = {
-            schemaVersion: 1,
+            schemaVersion: 2,
             complete,
             attacks: await historyGetRecords('attacks', range.from, range.to),
+            wars: await historyGetRecords('wars', range.from, range.to),
+            warReports: await historyGetRecords('warReports', range.from, range.to),
             crimes: await historyGetRecords('crimes', range.from, range.to),
             armory: await historyGetRecords('armory', range.from, range.to)
         };
@@ -2731,7 +2858,7 @@
                 <div class="bftd-fws-note" style="margin-top:7px">
                     The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report, then scans all outgoing faction attacks so war hits, assists, retals and outside hits are classified against the exact war windows/opponents.${state.includeChains ? ' After the attack history is complete, it loads completed chains that started inside the selected period and rebuilds member chain participation locally from those same attack records.' : ' Chain scanning is currently <b>OFF</b>, so no chain-history requests or chain processing will be performed.'} It then scans completed OCs and faction-armory Xanax actions. Every scan is saved by its exact Start/End timestamps. Re-running that exact same range replaces its previous saved scan; different ranges remain available in Cached Scans.
                 </div>
-                <div class="bftd-fws-ok" style="margin-top:8px"><b>LOCAL HISTORY CACHE:</b> Attacks, completed OCs, armory logs and completed chains are stored in this browser. Overlapping future scans reuse that history and request only missing date ranges. Shared scan downloads also carry the reusable history so another user can import it locally.</div>
+                <div class="bftd-fws-ok" style="margin-top:8px"><b>MASTER DATA CACHE:</b> Ranked-war history/reports, attacks, completed chains, completed OCs and armory logs accumulate in one reusable local browser cache. Future overlapping scans pull from that master data first and request only missing history. Separate quick-reload scan snapshots can be deleted without removing the master history.</div>
                 <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The first scan of a large uncached period can still take significantly longer. Once that history is cached locally, overlapping scans should need far fewer Torn API calls.</div>
                 <div class="bftd-fws-scanstatus">
                     <div class="bftd-fws-grow bftd-fws-note"><b>${esc(scanStatus)}</b>${scannedRange ? `<br>${esc(dateTime(scannedRange.from))} → ${esc(dateTime(scannedRange.to))}` : ''}</div>
@@ -2886,19 +3013,44 @@
             bringPanelFront(existing);
             return;
         }
-        state.cachedPanel = panelShell('bftd-fws-cache', 'Cached Scans', 'Local browser saves');
+        state.cachedPanel = panelShell('bftd-fws-cache', 'Cached Scans', 'Quick reload + master history');
         renderCachedScansPanel();
     }
 
-    function renderCachedScansPanel() {
+    async function renderCachedScansPanel() {
         const panel = document.getElementById('bftd-fws-cache');
         const body = panel?.querySelector('.bftd-fws-body');
         if (!body) return;
         const scans = getLocalCachedScans();
+        body.innerHTML = '<div class="bftd-fws-note">Loading local cache information…</div>';
+
+        const master = await getMasterCacheStats();
+        if (!body.isConnected) return;
+        const masterUpdated = master.updatedAt ? new Date(master.updatedAt).toLocaleString() : 'Never';
+        const masterTotal = master.attacks + master.wars + master.warReports + master.chains + master.crimes + master.armory;
+
         body.innerHTML = `
             <div class="bftd-fws-card">
-                <div style="font-weight:800">LOCAL CACHED SCANS</div>
-                <div class="bftd-fws-note" style="margin-top:4px">These scans are stored only in this browser/userscript setup. Loading one fills the main Start/End selectors with that scan's exact timestamps and immediately reopens its saved results without calling Torn.</div>
+                <div class="bftd-fws-row" style="align-items:flex-start">
+                    <div class="bftd-fws-grow">
+                        <div style="font-weight:800">MASTER DATA CACHE</div>
+                        <div class="bftd-fws-note" style="margin-top:4px">This is the permanent reusable faction-history cache. New scans add/update raw data here, and future overlapping scans pull from it before requesting Torn. Deleting a quick scan below does not remove this data.</div>
+                    </div>
+                    <button class="bftd-fws-btn danger" id="bftd-fws-clear-master-cache" ${masterTotal ? '' : 'disabled'}>CLEAR DATA</button>
+                </div>
+                <div class="bftd-fws-note" style="margin-top:8px">
+                    ${fmt(master.attacks)} attack(s) • ${fmt(master.wars)} war(s) • ${fmt(master.warReports)} war report(s) • ${fmt(master.chains)} chain(s) • ${fmt(master.crimes)} OC(s) • ${fmt(master.armory)} armory record(s)<br>
+                    Attack coverage: ${esc(coverageSpanText(master.attackCoverage))}<br>
+                    War coverage: ${esc(coverageSpanText(master.warCoverage))}<br>
+                    Chain coverage: ${esc(coverageSpanText(master.chainCoverage))}<br>
+                    OC coverage: ${esc(coverageSpanText(master.crimeCoverage))}<br>
+                    Armory coverage: ${esc(coverageSpanText(master.armoryCoverage))}<br>
+                    Last master update: ${esc(masterUpdated)}
+                </div>
+            </div>
+            <div class="bftd-fws-card">
+                <div style="font-weight:800">QUICK-RELOAD SCANS</div>
+                <div class="bftd-fws-note" style="margin-top:4px">Every successfully completed exact range is saved here for instant reload. These are disposable result snapshots: DELETE removes only that quick scan, while the Master Data Cache above remains available for future calculations.</div>
             </div>
             ${scans.length ? scans.map((row, index) => {
                 const range = row.range || {};
@@ -2913,14 +3065,16 @@
                                 <div class="bftd-fws-note">to ${esc(dateTime(range.to))}</div>
                             </div>
                             <button class="bftd-fws-btn" data-load-cache="${index}">LOAD</button>
+                            <button class="bftd-fws-btn danger" data-delete-cache="${index}">DELETE</button>
                         </div>
                         <div class="bftd-fws-note" style="margin-top:7px">
                             Saved ${esc(generated)} • ${fmt(row.warSummary?.warCount || 0)} war(s) • Chains: ${esc(chains)} • Scan time: ${esc(duration)}${row.importedAt ? ` • Imported ${esc(new Date(row.importedAt).toLocaleString())}` : ''}
                         </div>
                     </div>
                 `;
-            }).join('') : '<div class="bftd-fws-note">No saved scans are available for this faction on this browser yet.</div>'}
+            }).join('') : '<div class="bftd-fws-note">No quick-reload scans are available for this faction on this browser yet.</div>'}
         `;
+
         body.querySelectorAll('[data-load-cache]').forEach(btn => {
             btn.addEventListener('click', () => {
                 const row = scans[Number(btn.dataset.loadCache)];
@@ -2938,6 +3092,41 @@
                 renderMain();
                 if (state.mainPanel?.isConnected) bringPanelFront(state.mainPanel);
             });
+        });
+
+        body.querySelectorAll('[data-delete-cache]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const row = scans[Number(btn.dataset.deleteCache)];
+                const range = row?.range;
+                if (!range?.from || !range?.to) return;
+                clearPeriodCache(range);
+                state.shareMessage = `Quick scan deleted • ${dateTime(range.from)} → ${dateTime(range.to)}. Master history was kept.`;
+                state.shareMessageType = 'ok';
+                renderMain();
+                await renderCachedScansPanel();
+            });
+        });
+
+        body.querySelector('#bftd-fws-clear-master-cache')?.addEventListener('click', async () => {
+            const factionName = state.faction?.name || `Faction ${state.faction?.id || ''}`;
+            const confirmed = window.confirm(
+                `WARNING — CLEAR COMPLETE MASTER DATA?\n\n` +
+                `This will permanently clear the complete reusable Master Data Cache for ${factionName}, including cached attacks, ranked wars/reports, chains, organized crimes and armory history.\n\n` +
+                `Future scans will need to download that history from Torn again. Your separate quick-reload scan snapshots will NOT be deleted.\n\n` +
+                `Continue and clear the master data?`
+            );
+            if (!confirmed) return;
+            try {
+                await clearMasterCacheForFaction();
+                state.shareMessage = 'Master Data Cache cleared. Quick-reload scans were kept.';
+                state.shareMessageType = 'ok';
+                renderMain();
+                await renderCachedScansPanel();
+            } catch (err) {
+                state.shareMessage = err?.message || String(err);
+                state.shareMessageType = 'error';
+                renderMain();
+            }
         });
     }
 
@@ -3046,6 +3235,10 @@
                     chains: includeChains ? { apiPages: chainScan.historyPages, apiFetched: chainScan.apiChainsSeen, reused: Math.max(0, (chainScan.cacheCount || 0) - (chainScan.apiChainsSeen || 0)), missingRanges: chainScan.missingRangesFetched || 0 } : null
                 }
             );
+            await touchMasterCache(range, {
+                chainsIncluded: includeChains,
+                scanDurationMs: Date.now() - scanStartedAt
+            });
             if (document.getElementById('bftd-fws-cache')) renderCachedScansPanel();
 
             const completedIn = formatScanDuration(Date.now() - scanStartedAt);
@@ -3160,9 +3353,10 @@
     }
 
     function saveCacheStore(store) {
+        // Quick-scan snapshots are intentionally user-managed. Keep every unique
+        // completed range until the user deletes it from Cached Scans.
         const entries = Object.entries(store)
-            .sort((a, b) => num(b[1]?.generatedAt) - num(a[1]?.generatedAt))
-            .slice(0, 30);
+            .sort((a, b) => num(b[1]?.generatedAt) - num(a[1]?.generatedAt));
         GM_setValue(APP.cacheStorage, JSON.stringify(Object.fromEntries(entries)));
     }
 
@@ -3254,11 +3448,30 @@
         }
     }
 
-    function getCachedWarReport(warId) {
-        return loadWarReportCache()[String(warId)] || null;
+    async function getCachedWarReport(warId, warStart = 0) {
+        const master = await historyGetRecordById('warReports', warId);
+        if (master?.report) return master.report;
+        if (master && !master.report) return master;
+
+        // Backward compatibility: lazily migrate any v1.7.0-or-older report into
+        // the master data cache the first time it is needed.
+        const legacy = loadWarReportCache()[String(warId)] || null;
+        if (legacy) await putCachedWarReport(warId, legacy, warStart);
+        return legacy;
     }
 
-    function putCachedWarReport(warId, report) {
+    async function putCachedWarReport(warId, report, warStart = 0) {
+        if (!report) return;
+        const ts = Math.floor(num(warStart)) || Math.floor(Date.now() / 1000);
+        await historyPutRecords(
+            'warReports',
+            [{ id: String(warId), ts, report }],
+            row => row.id,
+            row => row.ts
+        );
+
+        // Keep a compatibility mirror so a temporary downgrade can still reopen
+        // recent reports. The master IndexedDB cache is the authoritative source.
         const store = loadWarReportCache();
         store[String(warId)] = report;
         const compact = Object.fromEntries(Object.entries(store).slice(-1000));
@@ -3558,52 +3771,87 @@
     }
 
     async function scanRankedWarsAndReports(range, onProgress) {
-        const selected = [];
-        const seen = new Set();
-        let offset = 0;
         let historyPages = 0;
-
-        while (true) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
-            const payload = await gmJson(apiUrl('/faction/rankedwars', { limit: 100, offset }));
-            historyPages += 1;
-            const rows = extractRankedWars(payload);
-            if (!rows.length) break;
-
-            let oldestStart = 0;
-            for (const raw of rows) {
-                const war = normalizeWar(raw);
-                if (!war.id || !war.start) continue;
-                if (!oldestStart || war.start < oldestStart) oldestStart = war.start;
-                if (war.start >= range.from && war.start <= range.to && !seen.has(war.id)) {
-                    seen.add(war.id);
-                    selected.push(war);
-                }
-            }
-
-            if (rows.length < 100 || (oldestStart && oldestStart < range.from)) break;
-            offset += rows.length;
-            if (historyPages > 500) throw new Error('Ranked-war history exceeded the safety limit (500 pages).');
-        }
-
-        selected.sort((a, b) => a.start - b.start);
-        const reportStats = {};
         let reportApiCalls = 0;
         let reportCacheHits = 0;
+
+        // Ranked-war rows are part of the master cache too. Only walk Torn's
+        // ranked-war history when some part of this exact date range is missing.
+        const missingRanges = await historyMissingRanges('wars', range.from, range.to);
+        if (missingRanges.length) {
+            const earliestNeeded = Math.min(...missingRanges.map(row => num(row?.[0])).filter(Boolean));
+            let offset = 0;
+            let historyComplete = false;
+
+            while (true) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                const payload = await gmJson(apiUrl('/faction/rankedwars', { limit: 100, offset }));
+                historyPages += 1;
+                const rows = extractRankedWars(payload);
+                if (!rows.length) {
+                    historyComplete = true;
+                    break;
+                }
+
+                const normalized = rows.map(normalizeWar).filter(w => w.id && w.start);
+                if (normalized.length) {
+                    await historyPutRecords('wars', normalized, row => row.id, row => row.start);
+                }
+
+                let oldestStart = 0;
+                for (const war of normalized) {
+                    if (!oldestStart || war.start < oldestStart) oldestStart = war.start;
+                }
+
+                if (rows.length < 100 || (oldestStart && oldestStart <= earliestNeeded)) {
+                    historyComplete = true;
+                    break;
+                }
+                offset += rows.length;
+                if (historyPages > 500) throw new Error('Ranked-war history exceeded the safety limit (500 pages).');
+            }
+
+            if (historyComplete) {
+                for (const [from, to] of missingRanges) await historyMarkCoverage('wars', from, to);
+            }
+        }
+
+        // For a range ending very recently, refresh the newest ranked-war page so
+        // an active/recently-ended war can update its end/winner without throwing
+        // away the historical cache. This is at most one extra request.
+        const now = Math.floor(Date.now() / 1000);
+        if (!missingRanges.length && range.to >= now - 24 * 60 * 60) {
+            if (state.abortScan) throw new Error('Scan cancelled.');
+            const payload = await gmJson(apiUrl('/faction/rankedwars', { limit: 100, offset: 0 }));
+            historyPages += 1;
+            const normalized = extractRankedWars(payload).map(normalizeWar).filter(w => w.id && w.start);
+            if (normalized.length) await historyPutRecords('wars', normalized, row => row.id, row => row.start);
+        }
+
+        const cachedWars = await historyGetRecords('wars', range.from, range.to);
+        const byId = new Map();
+        for (const war of cachedWars) {
+            if (!war?.id || !war?.start || war.start < range.from || war.start > range.to) continue;
+            const prev = byId.get(String(war.id));
+            if (!prev || num(war.end) >= num(prev.end)) byId.set(String(war.id), war);
+        }
+        const selected = [...byId.values()].sort((a, b) => a.start - b.start);
+
+        const reportStats = {};
         let done = 0;
         const completed = selected.filter(w => w.end > 0);
 
         for (const war of completed) {
             if (state.abortScan) throw new Error('Scan cancelled.');
-            let report = getCachedWarReport(war.id);
+            let report = await getCachedWarReport(war.id, war.start);
             if (report) {
                 reportCacheHits += 1;
             } else {
                 const payload = await gmJson(apiUrl(`/faction/${encodeURIComponent(war.id)}/rankedwarreport`));
                 report = extractRankedWarReport(payload);
                 reportApiCalls += 1;
-                if (report) putCachedWarReport(war.id, report);
-                }
+                if (report) await putCachedWarReport(war.id, report, war.start);
+            }
 
             if (report) {
                 const own = reportOwnFaction(report);
