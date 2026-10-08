@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.7.1
-// @description  Faction scanner with exact-range quick snapshots plus a persistent master local data cache, quick 1M/3M/6M/12M range presets, low-API chain analysis, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
+// @version      1.7.5
+// @description  Faction scanner with exact-range quick snapshots, persistent master local data cache, optional accurate per-chain reports, a separate faction-members panel, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
 // @connect      api.torn.com
@@ -18,22 +18,24 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.7.1',
+        version: '1.7.5',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
         warReportCacheStorage: 'bftd_fh_war_report_cache_v1',
+        chainReportCacheStorage: 'bftd_fh_chain_report_cache_v1',
         includeChainsStorage: 'bftd_fh_include_chains_v1',
         uiStorage: 'bftd_fws_ui_v1',
         cacheTtlMs: 365 * 24 * 60 * 60 * 1000,
         xanaxCacheTtlMs: 6 * 60 * 60 * 1000,
         requestDelayMs: 1500,
+        chainReportDelayMs: 2000,
         rateLimitPauseMs: 65000,
         maxRateLimitRetries: 6,
         maxTransientRetries: 3,
         apiBase: 'https://api.torn.com/v2',
         customKeyUrl:
-            'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=Faction%20Helper&user=faction,personalstats&faction=basic,members,attacks,crimes,news,rankedwars,rankedwarreport,chains'
+            'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=Faction%20Helper&user=faction,personalstats&faction=basic,members,attacks,crimes,news,rankedwars,rankedwarreport,chains,chainreport'
     };
 
     const state = {
@@ -45,12 +47,13 @@
         selectedPreset: 'custom',
         customStart: '',
         customEnd: '',
-        includeChains: Boolean(GM_getValue('bftd_fh_include_chains_v1', false)),
+        includeChains: Boolean(GM_getValue(APP.includeChainsStorage, false)),
         search: '',
         currentMember: null,
         mainPanel: null,
         statsPanel: null,
         cachedPanel: null,
+        memberPanel: null,
         launcher: null,
         loadingStats: false,
         scanRunning: false,
@@ -192,6 +195,41 @@
         return missing;
     }
 
+    async function buildMasterCacheScanPlan(range) {
+        const from = Math.floor(num(range?.from));
+        const to = Math.floor(num(range?.to));
+        if (!from || !to || to < from) {
+            return { wars: [], attacks: [], chains: [], crimes: [], armory: [] };
+        }
+
+        const [wars, attacks, chains, crimes, armory] = await Promise.all([
+            historyMissingRanges('wars', from, to),
+            historyMissingRanges('attacks', from, to),
+            historyMissingRanges('chains', from, to),
+            historyMissingRanges('crimes', from, to),
+            historyMissingRanges('armory', from, to)
+        ]);
+
+        return { wars, attacks, chains, crimes, armory };
+    }
+
+    function cloneMissingRanges(rows) {
+        return (Array.isArray(rows) ? rows : [])
+            .map(row => [Math.floor(num(row?.[0])), Math.floor(num(row?.[1]))])
+            .filter(([from, to]) => from > 0 && to >= from);
+    }
+
+    function scanPlanSummary(plan) {
+        const parts = [
+            ['wars', 'wars'],
+            ['attacks', 'attacks'],
+            ['chains', 'chains'],
+            ['crimes', 'OCs'],
+            ['armory', 'armory']
+        ].map(([key, label]) => `${label}: ${cloneMissingRanges(plan?.[key]).length} missing range(s)`);
+        return parts.join(' • ');
+    }
+
     async function historyPutRecords(type, rows, idGetter, tsGetter) {
         const db = await openHistoryDb();
         const factionId = historyFactionId();
@@ -278,11 +316,12 @@
     }
 
     async function getMasterCacheStats() {
-        const [attacks, wars, warReports, chains, crimes, armory, attackCoverage, warCoverage, chainCoverage, crimeCoverage, armoryCoverage, meta] = await Promise.all([
+        const [attacks, wars, warReports, chains, chainReports, crimes, armory, attackCoverage, warCoverage, chainCoverage, crimeCoverage, armoryCoverage, meta] = await Promise.all([
             historyCountType('attacks'),
             historyCountType('wars'),
             historyCountType('warReports'),
             historyCountType('chains'),
+            historyCountType('chainReports'),
             historyCountType('crimes'),
             historyCountType('armory'),
             historyGetCoverage('attacks'),
@@ -293,7 +332,7 @@
             historyGetRecordById('masterMeta', 'latest')
         ]);
         return {
-            attacks, wars, warReports, chains, crimes, armory,
+            attacks, wars, warReports, chains, chainReports, crimes, armory,
             attackCoverage, warCoverage, chainCoverage, crimeCoverage, armoryCoverage,
             updatedAt: num(meta?.updatedAt),
             completedScans: Math.max(0, num(meta?.completedScans))
@@ -354,50 +393,108 @@
         // v1.7.0 and older kept completed war reports in a separate userscript value.
         // Clear that compatibility copy as well so a deliberate master reset stays a real reset.
         GM_setValue(APP.warReportCacheStorage, '{}');
+        GM_setValue(APP.chainReportCacheStorage, '{}');
     }
 
-    async function historyImportBundle(bundle, range) {
-        if (!bundle || typeof bundle !== 'object') return;
-        const from = Math.floor(num(range?.from));
-        const to = Math.floor(num(range?.to));
-        if (!from || !to || to < from) return;
+
+    const MASTER_CACHE_EXPORT_TYPES = ['attacks', 'wars', 'warReports', 'chains', 'chainReports', 'crimes', 'armory'];
+    const MASTER_CACHE_COVERAGE_TYPES = ['attacks', 'wars', 'chains', 'crimes', 'armory'];
+
+    async function historyGetAllRecords(type) {
+        return historyGetRecords(type, 0, Number.MAX_SAFE_INTEGER);
+    }
+
+    async function exportMasterCacheFile() {
+        const factionId = historyFactionId();
+        if (!factionId) throw new Error('Faction details are not loaded yet.');
+        const records = {};
+        const coverage = {};
+        for (const type of MASTER_CACHE_EXPORT_TYPES) records[type] = await historyGetAllRecords(type);
+        for (const type of MASTER_CACHE_COVERAGE_TYPES) coverage[type] = await historyGetCoverage(type);
+        const masterMeta = await historyGetRecordById('masterMeta', 'latest');
+        const payload = {
+            kind: 'FactionHelperMasterCache',
+            schemaVersion: 1,
+            appVersion: APP.version,
+            exportedAt: Date.now(),
+            faction: {
+                id: factionId,
+                name: String(state.faction?.name || '')
+            },
+            coverage,
+            records,
+            masterMeta: masterMeta || null
+        };
+        const factionPart = safeDownloadName(state.faction?.name || `Faction_${factionId}`);
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        downloadTextFile(`Faction_Helper_Master_Cache_${factionPart}_${stamp}.json`, JSON.stringify(payload));
+    }
+
+    async function importMasterCacheFile(file) {
+        if (!file) return;
+        let payload;
+        try {
+            payload = JSON.parse(await file.text());
+        } catch {
+            throw new Error('The selected master-cache file is not valid JSON.');
+        }
+        if (!payload || payload.kind !== 'FactionHelperMasterCache' || Number(payload.schemaVersion) !== 1) {
+            throw new Error('This is not a valid Faction Helper Master Data Cache file.');
+        }
+        const factionId = Number(payload?.faction?.id || 0);
+        if (!factionId || factionId !== historyFactionId()) {
+            throw new Error(`This master cache belongs to faction ${factionId || 'unknown'}, not faction ${historyFactionId() || 'unknown'}.`);
+        }
+
+        const records = payload.records && typeof payload.records === 'object' ? payload.records : {};
         const specs = [
-            ['attacks', bundle.attacks, row => row?.id, row => row?.ended],
-            ['wars', bundle.wars, row => row?.id, row => row?.start],
-            ['warReports', bundle.warReports, row => row?.id, row => row?.ts || row?.start],
-            ['crimes', bundle.crimes, row => row?.id, row => row?.executed_at],
-            ['armory', bundle.armory, row => row?.id, row => row?.timestamp],
-            ['chains', bundle.chains, row => row?.id, row => row?.start]
+            ['attacks', records.attacks, row => row?.id, row => row?.ended],
+            ['wars', records.wars, row => row?.id, row => row?.start],
+            ['warReports', records.warReports, row => row?.id, row => row?.ts || row?.start],
+            ['chains', records.chains, row => row?.id, row => row?.start],
+            ['chainReports', records.chainReports, row => row?.id, row => row?.ts || row?.start],
+            ['crimes', records.crimes, row => row?.id, row => row?.executed_at],
+            ['armory', records.armory, row => row?.id, row => row?.timestamp]
         ];
         for (const [type, rows, idGetter, tsGetter] of specs) {
-            if (!Array.isArray(rows)) continue;
-            await historyPutRecords(type, rows, idGetter, tsGetter);
-            if (bundle?.complete?.[type] === true) await historyMarkCoverage(type, from, to);
+            if (!Array.isArray(rows) || !rows.length) continue;
+            const existingRows = await historyGetAllRecords(type);
+            const existingById = new Map(existingRows.map(row => [String(idGetter(row) ?? ''), row]));
+            const toWrite = [];
+            for (const row of rows) {
+                const id = String(idGetter(row) ?? '');
+                if (!id) continue;
+                const existing = existingById.get(id);
+                if (!existing) {
+                    toWrite.push(row);
+                    continue;
+                }
+                // Ranked-war history can be exported while a war is active. Only let an
+                // imported row replace a local row when it is demonstrably more complete.
+                if (type === 'wars' && num(row?.end) > num(existing?.end)) toWrite.push(row);
+            }
+            if (toWrite.length) await historyPutRecords(type, toWrite, idGetter, tsGetter);
         }
-        await touchMasterCache(range, { chainsIncluded: Array.isArray(bundle.chains) });
-    }
 
-    async function historyExportBundle(range, includeChains) {
-        const complete = {
-            attacks: (await historyMissingRanges('attacks', range.from, range.to)).length === 0,
-            wars: (await historyMissingRanges('wars', range.from, range.to)).length === 0,
-            crimes: (await historyMissingRanges('crimes', range.from, range.to)).length === 0,
-            armory: (await historyMissingRanges('armory', range.from, range.to)).length === 0
-        };
-        const bundle = {
-            schemaVersion: 2,
-            complete,
-            attacks: await historyGetRecords('attacks', range.from, range.to),
-            wars: await historyGetRecords('wars', range.from, range.to),
-            warReports: await historyGetRecords('warReports', range.from, range.to),
-            crimes: await historyGetRecords('crimes', range.from, range.to),
-            armory: await historyGetRecords('armory', range.from, range.to)
-        };
-        if (includeChains) {
-            complete.chains = (await historyMissingRanges('chains', range.from, range.to)).length === 0;
-            bundle.chains = await historyGetRecords('chains', range.from, range.to);
+        const coverage = payload.coverage && typeof payload.coverage === 'object' ? payload.coverage : {};
+        for (const type of MASTER_CACHE_COVERAGE_TYPES) {
+            for (const row of mergeCoverageIntervals(coverage[type] || [])) {
+                await historyMarkCoverage(type, row[0], row[1]);
+            }
         }
-        return bundle;
+
+        const incomingMeta = payload.masterMeta && typeof payload.masterMeta === 'object' ? payload.masterMeta : null;
+        const currentMeta = await historyGetRecordById('masterMeta', 'latest');
+        const nowSec = Math.floor(Date.now() / 1000);
+        await historyPutRecords('masterMeta', [{
+            id: 'latest',
+            ts: nowSec,
+            updatedAt: Date.now(),
+            completedScans: Math.max(num(currentMeta?.completedScans), num(incomingMeta?.completedScans)),
+            lastRange: incomingMeta?.lastRange || currentMeta?.lastRange || null,
+            chainsIncluded: Boolean(incomingMeta?.chainsIncluded || currentMeta?.chainsIncluded),
+            lastScanDurationMs: Math.max(0, num(incomingMeta?.lastScanDurationMs || currentMeta?.lastScanDurationMs))
+        }], row => row.id, row => row.ts);
     }
 
     const SUCCESS_RESULTS = new Set(['attacked', 'mugged', 'hospitalized', 'special', 'bounty', 'looted']);
@@ -600,14 +697,14 @@
         if (state.mainPanel && document.getElementById('bftd-fws-main')) renderMain();
     }
 
-    async function runQueuedApiRequest(url, key) {
+    async function runQueuedApiRequest(url, key, minDelayMs = APP.requestDelayMs) {
         let rateRetries = 0;
         let transientRetries = 0;
 
         while (true) {
             const elapsed = Date.now() - lastApiRequestStartedAt;
-            if (elapsed < APP.requestDelayMs) {
-                await interruptibleApiWait(APP.requestDelayMs - elapsed);
+            if (elapsed < minDelayMs) {
+                await interruptibleApiWait(minDelayMs - elapsed);
             }
 
             if (state.scanRunning && state.abortScan) throw new Error('Scan cancelled.');
@@ -641,7 +738,15 @@
     }
 
     function gmJson(url, key = state.apiKey) {
-        const run = () => runQueuedApiRequest(url, key);
+        const run = () => runQueuedApiRequest(url, key, APP.requestDelayMs);
+        const pending = apiRequestQueue.then(run, run);
+        apiRequestQueue = pending.catch(() => undefined);
+        return pending;
+    }
+
+    function gmJsonWithMinDelay(url, minDelayMs, key = state.apiKey) {
+        const delay = Math.max(APP.requestDelayMs, Math.floor(num(minDelayMs, APP.requestDelayMs)));
+        const run = () => runQueuedApiRequest(url, key, delay);
         const pending = apiRequestQueue.then(run, run);
         apiRequestQueue = pending.catch(() => undefined);
         return pending;
@@ -734,6 +839,12 @@
                 height: 560px;
                 top: 120px;
                 left: 80px;
+            }
+            #bftd-fws-members-panel {
+                width: 520px;
+                height: 620px;
+                top: 105px;
+                left: 110px;
             }
             .bftd-fws-head {
                 height: 42px;
@@ -951,7 +1062,7 @@
             @keyframes bftdFwsSlide { from{ transform:translateX(-100%);} to{transform:translateX(300%);} }
             @media (max-width: 700px) {
                 .bftd-fws-custom-dates { grid-template-columns:1fr; }
-                #bftd-fws-main, #bftd-fws-stats, #bftd-fws-cache {
+                #bftd-fws-main, #bftd-fws-stats, #bftd-fws-cache, #bftd-fws-members-panel {
                     width: calc(100vw - 18px) !important;
                     height: calc(100vh - 30px) !important;
                     top: 10px !important;
@@ -1176,6 +1287,12 @@
                 height:min(720px,calc(100vh - 70px));
                 top:80px;
                 left:24px;
+            }
+            #bftd-fws-members-panel {
+                width:min(560px,calc(100vw - 40px));
+                height:min(660px,calc(100vh - 70px));
+                top:90px;
+                left:70px;
             }
 
             .bftd-fws-head {
@@ -1522,7 +1639,7 @@
                     max-width:calc(100vw - 6px) !important;
                     max-height:calc(100vh - 6px) !important;
                 }
-                #bftd-fws-main,#bftd-fws-stats {
+                #bftd-fws-main,#bftd-fws-stats,#bftd-fws-members-panel,#bftd-fws-cache {
                     width:calc(100vw - 16px);
                     height:calc(100vh - 28px);
                     top:8px;
@@ -2445,7 +2562,7 @@
                 <div style="font-weight:800;margin-bottom:6px">Faction API key required</div>
                 <div class="bftd-fws-note">
                     This script only unlocks when your Torn position has <b>Faction API Access</b>.
-                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>chains</b> is only required when the Include Chains option is enabled. Faction Helper no longer needs <b>chainreport</b> permission because chain participation is rebuilt locally from the attack scan.
+                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>chains</b> and <b>chainreport</b> are only required when the Include Chains option is enabled.
                     The key is stored locally in this userscript manager and is sent only to Torn's API.
                 </div>
             </div>
@@ -2486,7 +2603,7 @@
             <div class="bftd-fws-card">
                 <div class="bftd-fws-note">
                     Required: your Torn faction position must have <b>Faction API Access</b>, and the API key must allow
-                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/chains</b> is additionally required only when Include Chains is enabled; <b>faction/chainreport</b> is no longer required.
+                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/chains</b> and <b>faction/chainreport</b> are additionally required only when Include Chains is enabled.
                 </div>
                 <div class="bftd-fws-row" style="margin-top:9px">
                     <button id="bftd-fws-retry" class="bftd-fws-btn">RETRY</button>
@@ -2630,159 +2747,6 @@
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
-    async function exportSelectedScan() {
-        const requestedRange = getPresetRange();
-        if (!requestedRange.valid) {
-            throw new Error(requestedRange.validationMessage || 'Choose a valid start and end date/time first.');
-        }
-        const cached = getCached(requestedRange);
-        if (!cached?.aggregates || !cached?.ocAggregates || !cached?.armoryXanaxAggregates || !cached?.warSummary) {
-            throw new Error('No completed scan is available for the selected start/end range.');
-        }
-
-        const range = cached.range || requestedRange;
-        const membersSnapshot = Array.isArray(cached.membersSnapshot) && cached.membersSnapshot.length
-            ? cloneMembersSnapshot(cached.membersSnapshot)
-            : cloneMembersSnapshot(state.members);
-        const rawXanaxStore = loadXanaxCacheStore();
-        const xanaxSnapshots = {};
-        for (const member of membersSnapshot) {
-            const row = rawXanaxStore[xanaxCacheKey(member?.id, range)];
-            if (row) xanaxSnapshots[String(member.id)] = row;
-        }
-
-        const payload = {
-            kind: 'FactionHelperScan',
-            schemaVersion: 2,
-            appVersion: APP.version,
-            exportedAt: Date.now(),
-            faction: {
-                id: Number(state.faction?.id || 0),
-                name: String(state.faction?.name || '')
-            },
-            period: 'custom',
-            scan: {
-                ...cached,
-                membersSnapshot
-            },
-            xanaxSnapshots,
-            historyBundle: await historyExportBundle(range, Boolean(cached.chainsIncluded || cached.chainSummary))
-        };
-
-        const factionPart = safeDownloadName(state.faction?.name || `Faction_${state.faction?.id || 0}`);
-        const stamp = new Date(cached.generatedAt || Date.now()).toISOString().replace(/[:.]/g, '-');
-        const rangePart = `RANGE_${new Date(range.from * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}_to_${new Date(range.to * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}`;
-        const filename = `Faction_Helper_${factionPart}_${rangePart}_${stamp}.json`;
-        downloadTextFile(filename, JSON.stringify(payload));
-        state.shareMessage = 'Selected-range scan downloaded and ready to share.';
-        state.shareMessageType = 'ok';
-        renderMain();
-    }
-
-    function validateImportedScan(payload) {
-        if (!payload || payload.kind !== 'FactionHelperScan' || ![1,2].includes(Number(payload.schemaVersion))) {
-            throw new Error('This is not a valid Faction Helper scan-share file.');
-        }
-        const factionId = Number(payload?.faction?.id || 0);
-        if (!factionId || factionId !== Number(state.faction?.id || 0)) {
-            throw new Error(`This scan belongs to faction ${factionId || 'unknown'}, not faction ${state.faction?.id || 'unknown'}.`);
-        }
-
-        const scan = payload.scan;
-        if (!scan || typeof scan !== 'object') throw new Error('The scan-share file is missing its scan data.');
-        const from = Math.floor(num(scan?.range?.from));
-        const to = Math.floor(num(scan?.range?.to));
-        if (!from || !to || from >= to) throw new Error('The scan-share file has an invalid date range.');
-        const startDate = new Date(from * 1000);
-        const maxEnd = addCalendarMonthsClamped(startDate, 60);
-        if (to * 1000 > maxEnd.getTime()) throw new Error('This scan is longer than the 60-month maximum.');
-        if (!scan.aggregates || typeof scan.aggregates !== 'object') throw new Error('The scan-share file is missing attack aggregates.');
-        if (!scan.ocAggregates || typeof scan.ocAggregates !== 'object') throw new Error('The scan-share file is missing OC aggregates.');
-        if (!scan.armoryXanaxAggregates || typeof scan.armoryXanaxAggregates !== 'object') throw new Error('The scan-share file is missing armory Xanax aggregates.');
-        if (!scan.warSummary || typeof scan.warSummary !== 'object') throw new Error('The scan-share file is missing ranked-war data.');
-
-        const range = {
-            code:'custom',
-            label:'Selected time period',
-            from,
-            to,
-            valid:true
-        };
-        const membersSnapshot = Array.isArray(scan.membersSnapshot)
-            ? scan.membersSnapshot.filter(m => Number(m?.id) > 0)
-            : [];
-
-        return { scan, range, membersSnapshot, code:'custom' };
-    }
-
-    async function importSelectedScan(file) {
-        if (!file) return;
-        let payload;
-        try {
-            payload = JSON.parse(await file.text());
-        } catch {
-            throw new Error('The selected file is not valid JSON.');
-        }
-
-        const { scan, range, membersSnapshot, code } = validateImportedScan(payload);
-        state.customStart = localDateTimeInputValue(range.from * 1000);
-        state.customEnd = localDateTimeInputValue(range.to * 1000);
-        const importedEntry = {
-            generatedAt: num(scan.generatedAt, Date.now()),
-            range,
-            aggregates: scan.aggregates,
-            ocAggregates: scan.ocAggregates,
-            armoryXanaxAggregates: scan.armoryXanaxAggregates,
-            warSummary: scan.warSummary,
-            chainSummary: scan.chainSummary && typeof scan.chainSummary === 'object' ? scan.chainSummary : null,
-            chainsIncluded: scan.chainsIncluded === true || Boolean(scan.chainSummary && typeof scan.chainSummary === 'object'),
-            pageCount: num(scan.pageCount),
-            fetchedCount: num(scan.fetchedCount),
-            ocPageCount: num(scan.ocPageCount),
-            ocCount: num(scan.ocCount),
-            armoryPageCount: num(scan.armoryPageCount),
-            armoryNewsCount: num(scan.armoryNewsCount),
-            scanDurationMs: Math.max(0, num(scan.scanDurationMs)),
-            historyCacheStats: scan.historyCacheStats && typeof scan.historyCacheStats === 'object' ? scan.historyCacheStats : null,
-            membersSnapshot: membersSnapshot.length ? cloneMembersSnapshot(membersSnapshot) : cloneMembersSnapshot(state.members),
-            importedAt: Date.now(),
-            importedFromVersion: String(payload.appVersion || 'unknown'),
-            importedFileName: String(file.name || '')
-        };
-        savePeriodCacheEntry(range, importedEntry);
-        if (payload.historyBundle && typeof payload.historyBundle === 'object') {
-            await historyImportBundle(payload.historyBundle, range);
-        }
-
-        if (payload.xanaxSnapshots && typeof payload.xanaxSnapshots === 'object') {
-            const xanaxStore = loadXanaxCacheStore();
-            for (const [memberId, row] of Object.entries(payload.xanaxSnapshots)) {
-                if (!row || typeof row !== 'object' || Number(memberId) <= 0) continue;
-                xanaxStore[xanaxCacheKey(memberId, range)] = {
-                    ...row,
-                    sourceGeneratedAt: num(row.generatedAt),
-                    generatedAt: Date.now(),
-                    from: range.from,
-                    to: range.to
-                };
-            }
-            const compact = Object.fromEntries(
-                Object.entries(xanaxStore)
-                    .sort((a,b) => num(b[1]?.generatedAt) - num(a[1]?.generatedAt))
-                    .slice(0, 80)
-            );
-            GM_setValue(APP.xanaxCacheStorage, JSON.stringify(compact));
-        }
-
-        state.currentMember = null;
-        document.getElementById('bftd-fws-stats')?.remove();
-        state.statsPanel = null;
-        state.scanError = '';
-        state.shareMessage = 'Shared scan imported and loaded for this exact start/end range. No faction rescan is required.';
-        state.shareMessageType = 'ok';
-        renderMain();
-        if (document.getElementById('bftd-fws-cache')) renderCachedScansPanel();
-    }
 
     function renderMain() {
         const body = state.mainPanel?.querySelector('.bftd-fws-body');
@@ -2850,25 +2814,24 @@
                         <input id="bftd-fws-include-chains" type="checkbox" ${state.includeChains ? 'checked' : ''} ${state.scanRunning ? 'disabled' : ''} style="margin:2px 2px 0 0;transform:scale(1.2);accent-color:var(--bftd-accent)">
                         <span class="bftd-fws-grow">
                             <b>INCLUDE CHAINS IN THIS SCAN</b><br>
-                            <span class="bftd-fws-note">${state.includeChains ? 'ON — completed-chain history will be loaded, then participation will be rebuilt locally from the attack scan.' : 'OFF — all chain-history API calls and chain processing will be skipped.'}</span>
+                            <span class="bftd-fws-note">${state.includeChains ? 'ON — completed chains and accurate per-chain reports will be included.' : 'OFF — chain history/report API calls will be skipped.'}</span>
                         </span>
                     </label>
-                    <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Enabling chains adds completed-chain history calls and extra local sorting. It no longer makes one chain-report API call per chain, but long multi-year ranges with lots of chains can still add significant processing time.</div>
+                    <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Each uncached completed chain report is loaded one-by-one with a minimum <b>2-second</b> gap. Reports already stored in the Master Data Cache are reused without another chain-report API call.</div>
                 </div>
                 <div class="bftd-fws-note" style="margin-top:7px">
-                    The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report, then scans all outgoing faction attacks so war hits, assists, retals and outside hits are classified against the exact war windows/opponents.${state.includeChains ? ' After the attack history is complete, it loads completed chains that started inside the selected period and rebuilds member chain participation locally from those same attack records.' : ' Chain scanning is currently <b>OFF</b>, so no chain-history requests or chain processing will be performed.'} It then scans completed OCs and faction-armory Xanax actions. Every scan is saved by its exact Start/End timestamps. Re-running that exact same range replaces its previous saved scan; different ranges remain available in Cached Scans.
+                    The scan first checks the Master Data Cache for the complete selected Start/End range. It loads all cached data inside that period, requests only missing coverage, writes the new records into the Master Cache, then builds the finished scan from the Master Cache across the full period. Ranked wars are processed first, followed by attacks.${state.includeChains ? ' Completed chains are then loaded and each missing chain report is fetched accurately one-by-one at the 2-second report pace.' : ' Chain scanning is currently <b>OFF</b>.'} Completed OCs and faction-armory Xanax actions follow. Every successful exact range is also saved as a disposable quick-reload snapshot.
                 </div>
-                <div class="bftd-fws-ok" style="margin-top:8px"><b>MASTER DATA CACHE:</b> Ranked-war history/reports, attacks, completed chains, completed OCs and armory logs accumulate in one reusable local browser cache. Future overlapping scans pull from that master data first and request only missing history. Separate quick-reload scan snapshots can be deleted without removing the master history.</div>
+                <div class="bftd-fws-ok" style="margin-top:8px"><b>MASTER DATA CACHE:</b> Ranked-war history/reports, attacks, completed chain lists/reports, completed OCs and armory logs accumulate in one reusable local browser cache. Before every scan, Faction Helper checks the full selected Start/End range against this master data first. Each stage then requests only uncovered intervals and reads every covered interval locally. Separate quick-reload scan snapshots can be deleted without removing the master history.</div>
                 <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The first scan of a large uncached period can still take significantly longer. Once that history is cached locally, overlapping scans should need far fewer Torn API calls.</div>
                 <div class="bftd-fws-scanstatus">
                     <div class="bftd-fws-grow bftd-fws-note"><b>${esc(scanStatus)}</b>${scannedRange ? `<br>${esc(dateTime(scannedRange.from))} → ${esc(dateTime(scannedRange.to))}` : ''}</div>
                     <button id="bftd-fws-scan" class="bftd-fws-btn" ${(state.scanRunning || !customValidation.valid) ? 'disabled' : ''}>${esc(scanLabel)}</button>
                 </div>
                 <div class="bftd-fws-row wrap" style="margin-top:8px">
-                    <button id="bftd-fws-download-scan" class="bftd-fws-btn secondary" ${(!ready || state.scanRunning) ? 'disabled' : ''}>DOWNLOAD SCAN</button>
-                    <button id="bftd-fws-upload-scan" class="bftd-fws-btn secondary" ${state.scanRunning ? 'disabled' : ''}>UPLOAD SCAN</button>
                     <button id="bftd-fws-cached-scans" class="bftd-fws-btn secondary" ${state.scanRunning ? 'disabled' : ''}>CACHED SCANS</button>
-                    <input id="bftd-fws-upload-scan-file" type="file" accept=".json,application/json" hidden>
+                    <button id="bftd-fws-open-members" class="bftd-fws-btn secondary">MEMBERS</button>
+                    <button id="bftd-fws-settings" class="bftd-fws-btn secondary" title="API key settings" ${state.scanRunning ? 'disabled' : ''}>⚙ SETTINGS</button>
                 </div>
                 ${state.shareMessage ? `<div class="${state.shareMessageType === 'error' ? 'bftd-fws-error' : 'bftd-fws-ok'}" style="margin-top:8px">${esc(state.shareMessage)}</div>` : ''}
                 ${state.scanRunning ? `
@@ -2881,14 +2844,6 @@
                 ${state.scanError ? `<div class="bftd-fws-error" style="margin-top:8px">${esc(state.scanError)}</div>` : ''}
             </div>
 
-            <div class="bftd-fws-row" style="margin-bottom:9px">
-                <input id="bftd-fws-search" class="bftd-fws-input bftd-fws-grow" placeholder="Search faction members…" value="${esc(state.search)}">
-                <button id="bftd-fws-refresh-members" class="bftd-fws-btn secondary" title="Reload member list" ${state.scanRunning ? 'disabled' : ''}>↻</button>
-                <button id="bftd-fws-settings" class="bftd-fws-btn secondary" title="API key settings" ${state.scanRunning ? 'disabled' : ''}>⚙</button>
-            </div>
-
-            <div id="bftd-fws-member-count" class="bftd-fws-note" style="margin:0 0 7px"></div>
-            <div id="bftd-fws-members" class="bftd-fws-members"></div>
         `;
 
         body.querySelectorAll('[data-quick-months]').forEach(btn => {
@@ -2901,6 +2856,7 @@
                 state.shareMessage = '';
                 state.shareMessageType = '';
                 renderMain();
+                if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
             });
         });
 
@@ -2931,6 +2887,7 @@
             state.shareMessage = '';
             state.shareMessageType = '';
             renderMain();
+            if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
         });
         customEndInput?.addEventListener('change', () => {
             state.customEnd = customEndInput.value;
@@ -2941,68 +2898,21 @@
             state.shareMessage = '';
             state.shareMessageType = '';
             renderMain();
-        });
-
-        body.querySelector('#bftd-fws-include-chains')?.addEventListener('change', event => {
-            state.includeChains = Boolean(event.target.checked);
-            GM_setValue(APP.includeChainsStorage, state.includeChains);
-            state.scanError = '';
-            state.shareMessage = '';
-            state.shareMessageType = '';
-            renderMain();
+            if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
         });
 
         body.querySelector('#bftd-fws-scan')?.addEventListener('click', () => runFactionScan(true));
         body.querySelector('#bftd-fws-cancel-main-scan')?.addEventListener('click', () => { state.abortScan = true; });
-        body.querySelector('#bftd-fws-download-scan')?.addEventListener('click', async () => {
-            try {
-                state.shareMessage = 'Preparing scan + reusable local history…';
-                state.shareMessageType = 'ok';
-                renderMain();
-                await exportSelectedScan();
-            } catch (err) {
-                state.shareMessage = err.message || String(err);
-                state.shareMessageType = 'error';
-                renderMain();
-            }
+        body.querySelector('#bftd-fws-include-chains')?.addEventListener('change', event => {
+            state.includeChains = Boolean(event.target.checked);
+            GM_setValue(APP.includeChainsStorage, state.includeChains);
+            state.shareMessage = '';
+            state.shareMessageType = '';
+            renderMain();
         });
         body.querySelector('#bftd-fws-cached-scans')?.addEventListener('click', openCachedScansPanel);
-        const uploadInput = body.querySelector('#bftd-fws-upload-scan-file');
-        body.querySelector('#bftd-fws-upload-scan')?.addEventListener('click', () => uploadInput?.click());
-        uploadInput?.addEventListener('change', async () => {
-            const file = uploadInput.files?.[0];
-            if (!file) return;
-            try {
-                state.shareMessage = '';
-                state.shareMessageType = '';
-                await importSelectedScan(file);
-            } catch (err) {
-                state.shareMessage = err.message || String(err);
-                state.shareMessageType = 'error';
-                renderMain();
-            } finally {
-                uploadInput.value = '';
-            }
-        });
-
-        const search = body.querySelector('#bftd-fws-search');
-        search?.addEventListener('input', () => {
-            state.search = search.value;
-            renderMemberList();
-        });
-
-        body.querySelector('#bftd-fws-refresh-members')?.addEventListener('click', async () => {
-            renderMainLoading('Reloading faction members…');
-            try {
-                await authenticateAndLoad();
-                renderMain();
-            } catch (err) {
-                renderLocked(err.message);
-            }
-        });
-
+        body.querySelector('#bftd-fws-open-members')?.addEventListener('click', openMemberListPanel);
         body.querySelector('#bftd-fws-settings')?.addEventListener('click', () => renderApiSetup());
-        renderMemberList();
     }
 
     function openCachedScansPanel() {
@@ -3027,19 +2937,24 @@
         const master = await getMasterCacheStats();
         if (!body.isConnected) return;
         const masterUpdated = master.updatedAt ? new Date(master.updatedAt).toLocaleString() : 'Never';
-        const masterTotal = master.attacks + master.wars + master.warReports + master.chains + master.crimes + master.armory;
+        const masterTotal = master.attacks + master.wars + master.warReports + master.chains + master.chainReports + master.crimes + master.armory;
 
         body.innerHTML = `
             <div class="bftd-fws-card">
                 <div class="bftd-fws-row" style="align-items:flex-start">
                     <div class="bftd-fws-grow">
                         <div style="font-weight:800">MASTER DATA CACHE</div>
-                        <div class="bftd-fws-note" style="margin-top:4px">This is the permanent reusable faction-history cache. New scans add/update raw data here, and future overlapping scans pull from it before requesting Torn. Deleting a quick scan below does not remove this data.</div>
+                        <div class="bftd-fws-note" style="margin-top:4px">This is the permanent reusable faction-history cache. New scans add/update raw data and permanent war/chain reports here, and future overlapping scans pull from it before requesting Torn. Deleting a quick scan below does not remove this data.</div>
                     </div>
-                    <button class="bftd-fws-btn danger" id="bftd-fws-clear-master-cache" ${masterTotal ? '' : 'disabled'}>CLEAR DATA</button>
+                    <div class="bftd-fws-row wrap" style="justify-content:flex-end">
+                        <button class="bftd-fws-btn secondary" id="bftd-fws-download-master-cache" ${masterTotal ? '' : 'disabled'}>DOWNLOAD MASTER</button>
+                        <button class="bftd-fws-btn secondary" id="bftd-fws-upload-master-cache">UPLOAD MASTER</button>
+                        <button class="bftd-fws-btn danger" id="bftd-fws-clear-master-cache" ${masterTotal ? '' : 'disabled'}>CLEAR DATA</button>
+                        <input id="bftd-fws-upload-master-file" type="file" accept=".json,application/json" hidden>
+                    </div>
                 </div>
                 <div class="bftd-fws-note" style="margin-top:8px">
-                    ${fmt(master.attacks)} attack(s) • ${fmt(master.wars)} war(s) • ${fmt(master.warReports)} war report(s) • ${fmt(master.chains)} chain(s) • ${fmt(master.crimes)} OC(s) • ${fmt(master.armory)} armory record(s)<br>
+                    ${fmt(master.attacks)} attack(s) • ${fmt(master.wars)} war(s) • ${fmt(master.warReports)} war report(s) • ${fmt(master.chains)} chain(s) • ${fmt(master.chainReports)} chain report(s) • ${fmt(master.crimes)} OC(s) • ${fmt(master.armory)} armory record(s)<br>
                     Attack coverage: ${esc(coverageSpanText(master.attackCoverage))}<br>
                     War coverage: ${esc(coverageSpanText(master.warCoverage))}<br>
                     Chain coverage: ${esc(coverageSpanText(master.chainCoverage))}<br>
@@ -3090,7 +3005,8 @@
                 state.shareMessage = `Cached scan loaded • ${dateTime(range.from)} → ${dateTime(range.to)}.`;
                 state.shareMessageType = 'ok';
                 renderMain();
-                if (state.mainPanel?.isConnected) bringPanelFront(state.mainPanel);
+                openMemberListPanel();
+                if (state.memberPanel?.isConnected) bringPanelFront(state.memberPanel);
             });
         });
 
@@ -3107,11 +3023,47 @@
             });
         });
 
+        body.querySelector('#bftd-fws-download-master-cache')?.addEventListener('click', async () => {
+            try {
+                state.shareMessage = 'Preparing full Master Data Cache export…';
+                state.shareMessageType = 'ok';
+                renderMain();
+                await exportMasterCacheFile();
+                state.shareMessage = 'Full Master Data Cache downloaded.';
+                state.shareMessageType = 'ok';
+                renderMain();
+            } catch (err) {
+                state.shareMessage = err?.message || String(err);
+                state.shareMessageType = 'error';
+                renderMain();
+            }
+        });
+
+        const masterUploadInput = body.querySelector('#bftd-fws-upload-master-file');
+        body.querySelector('#bftd-fws-upload-master-cache')?.addEventListener('click', () => masterUploadInput?.click());
+        masterUploadInput?.addEventListener('change', async () => {
+            const file = masterUploadInput.files?.[0];
+            if (!file) return;
+            try {
+                await importMasterCacheFile(file);
+                state.shareMessage = 'Master Data Cache imported and merged with existing local master data.';
+                state.shareMessageType = 'ok';
+                renderMain();
+                await renderCachedScansPanel();
+            } catch (err) {
+                state.shareMessage = err?.message || String(err);
+                state.shareMessageType = 'error';
+                renderMain();
+            } finally {
+                masterUploadInput.value = '';
+            }
+        });
+
         body.querySelector('#bftd-fws-clear-master-cache')?.addEventListener('click', async () => {
             const factionName = state.faction?.name || `Faction ${state.faction?.id || ''}`;
             const confirmed = window.confirm(
                 `WARNING — CLEAR COMPLETE MASTER DATA?\n\n` +
-                `This will permanently clear the complete reusable Master Data Cache for ${factionName}, including cached attacks, ranked wars/reports, chains, organized crimes and armory history.\n\n` +
+                `This will permanently clear the complete reusable Master Data Cache for ${factionName}, including cached attacks, ranked wars/reports, completed chains, chain reports, organized crimes and armory history.\n\n` +
                 `Future scans will need to download that history from Torn again. Your separate quick-reload scan snapshots will NOT be deleted.\n\n` +
                 `Continue and clear the master data?`
             );
@@ -3143,58 +3095,75 @@
             renderMain();
             return;
         }
+
         const includeChains = Boolean(state.includeChains);
         const totalStages = includeChains ? 5 : 4;
         state.scanRunning = true;
+        let scanSucceeded = false;
         const scanStartedAt = Date.now();
         state.abortScan = false;
         state.scanError = '';
         state.shareMessage = '';
         state.shareMessageType = '';
-        // Keep the last good scan until the replacement scan finishes successfully.
+        // Keep the last good quick-reload scan until the replacement finishes successfully.
         renderMain();
 
         try {
-            setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, 'Finding wars that started inside the selected period. Completed war reports are cached permanently by war ID.');
+            setScanProgress('Checking Master Data Cache…', 'Loading every cached record already available inside the complete selected Start/End range before any historical Torn requests are made.');
+            const cachePlan = await buildMasterCacheScanPlan(range);
+            if (!includeChains) cachePlan.chains = [];
+            setScanProgress('Master Data Cache checked', `${scanPlanSummary(cachePlan)}${includeChains ? '' : ' • chains: skipped'}. Only uncovered intervals and missing permanent report IDs will be requested from Torn.`);
+
+            setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `Using Master Data Cache first • ${cachePlan.wars.length} uncovered war-history range(s). Completed war reports are cached permanently by war ID.`);
             const warScan = await scanRankedWarsAndReports(range, (done, total, apiCalls, cacheHits) => {
-                setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `${done}/${total} war reports processed • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
-            });
+                setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `${done}/${total} war reports processed • ${apiCalls} new API report call(s) • ${cacheHits} master-cache report(s)`);
+            }, cachePlan.wars);
 
             let stage = 2;
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning all faction attacks…`, 'Loading the detailed outgoing attack history first so war and optional chain calculations use the exact same attack records.');
+            setScanProgress(`${stage}/${totalStages} — Scanning all faction attacks…`, 'Loading only attack-history gaps not already covered by the Master Data Cache. The finished attack dataset is then rebuilt from the Master Cache for the full selected period.');
             const attackStage = stage;
             const attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks, missingRanges, currentRange, cacheReuse) => {
-                setScanProgress(`${attackStage}/${totalStages} — Scanning all faction attacks…`, `${pages} new API page(s) • ${attacks} attack record(s) • ${cacheReuse || 0} reused from local history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
-            });
+                setScanProgress(`${attackStage}/${totalStages} — Scanning all faction attacks…`, `${pages} new API page(s) • ${attacks} attack record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
+            }, cachePlan.attacks);
             stage += 1;
 
-            let chainScan = { chains: [], historyPages: 0 };
+            let chainScan = { chains: [], historyPages: 0, apiChainsSeen: 0, cacheCount: 0, missingRangesFetched: 0, reportApiCalls: 0, reportCacheHits: 0, summary: null };
             let chainSummary = null;
             if (includeChains) {
                 if (state.abortScan) throw new Error('Scan cancelled.');
-                setScanProgress(`${stage}/${totalStages} — Loading & sorting completed chains…`, 'Attack history is complete. Loading completed-chain windows, then validating each chain hit locally — 0 per-chain report calls.');
-                chainScan = await scanFactionChainHistory(range, (pages, chainsFound, totalRanges, currentRange) => {
-                    setScanProgress(`${stage}/${totalStages} — Loading & sorting completed chains…`, `${pages} new chain-history API page(s) • ${chainsFound} chain row(s) fetched • missing range ${currentRange || 0}/${totalRanges || 0} • 0 chain-report calls`);
-                });
-                chainSummary = buildAccurateLocalChainSummary(chainScan, attackScan.attacks, range, warScan.wars);
+                const chainStage = stage;
+                setScanProgress(`${chainStage}/${totalStages} — Loading completed chains & reports…`, 'Checking cached chain history and permanent chain reports first. Only missing chain reports are requested, one at a time with a minimum 2-second gap.');
+                chainScan = await scanFactionChainsAndReports(range, info => {
+                    if (info?.phase === 'history') {
+                        setScanProgress(`${chainStage}/${totalStages} — Loading completed chains & reports…`, `${info.pages || 0} new chain-history page(s) • ${info.chainsFound || 0} chain row(s) fetched • missing range ${info.currentRange || 0}/${info.totalRanges || 0}`);
+                    } else {
+                        setScanProgress(`${chainStage}/${totalStages} — Loading completed chains & reports…`, `${info.done || 0}/${info.total || 0} chain report(s) processed • ${info.apiCalls || 0} new report call(s) • ${info.cacheHits || 0} master-cache report(s) • 2s minimum report pacing`);
+                    }
+                }, cachePlan.chains);
+                chainSummary = chainScan.summary;
                 stage += 1;
             }
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning completed organized crimes…`, 'Counting completed OCs by executed_at and participant slot.');
+            setScanProgress(`${stage}/${totalStages} — Scanning completed organized crimes…`, 'Loading only OC-history gaps, writing them into the Master Cache, then rebuilding the full selected period from master data.');
             const ocStage = stage;
             const ocScan = await scanFactionCrimes(range, (pages, crimes, cacheReuse, missingRanges, currentRange) => {
-                setScanProgress(`${ocStage}/${totalStages} — Scanning completed organized crimes…`, `${pages} new OC API page(s) • ${crimes} completed OC record(s) • ${cacheReuse || 0} reused from local history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
-            });
+                setScanProgress(`${ocStage}/${totalStages} — Scanning completed organized crimes…`, `${pages} new OC API page(s) • ${crimes} completed OC record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
+            }, cachePlan.crimes);
             stage += 1;
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning faction armory Xanax…`, 'Counting Xanax armory actions by member.');
+            setScanProgress(`${stage}/${totalStages} — Scanning faction armory Xanax…`, 'Loading only armory-history gaps, writing them into the Master Cache, then rebuilding the full selected period from master data.');
             const armoryStage = stage;
             const armoryScan = await scanFactionArmoryXanax(range, (pages, newsCount, cacheReuse, missingRanges, currentRange) => {
-                setScanProgress(`${armoryStage}/${totalStages} — Scanning faction armory Xanax…`, `${pages} new armory API page(s) • ${newsCount} record(s) • ${cacheReuse || 0} reused from local history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
-            });
+                setScanProgress(`${armoryStage}/${totalStages} — Scanning faction armory Xanax…`, `${pages} new armory API page(s) • ${newsCount} record(s) • ${cacheReuse || 0} reused from master history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
+            }, cachePlan.armory);
+
+            // Every historical stage above writes new information into IndexedDB first and
+            // then returns calculations made from the Master Data Cache. Quick scan snapshots
+            // below are only disposable precomputed views of that master data.
+            setScanProgress('Building finished scan from Master Data Cache…', 'All newly fetched data is stored. Building the complete selected Start/End result from the combined cached history.');
 
             const warSummary = {
                 warCount: warScan.wars.length,
@@ -3232,7 +3201,14 @@
                     attacks: { apiPages: attackScan.pageCount, apiFetched: attackScan.apiFetchedCount, reused: attackScan.cacheReuseCount, missingRanges: attackScan.missingRangeCount },
                     crimes: { apiPages: ocScan.pageCount, apiFetched: ocScan.apiFetchedCount, reused: ocScan.cacheReuseCount, missingRanges: ocScan.missingRangeCount },
                     armory: { apiPages: armoryScan.pageCount, apiFetched: armoryScan.apiFetchedCount, reused: armoryScan.cacheReuseCount, missingRanges: armoryScan.missingRangeCount },
-                    chains: includeChains ? { apiPages: chainScan.historyPages, apiFetched: chainScan.apiChainsSeen, reused: Math.max(0, (chainScan.cacheCount || 0) - (chainScan.apiChainsSeen || 0)), missingRanges: chainScan.missingRangesFetched || 0 } : null
+                    chains: includeChains ? {
+                        apiPages: chainScan.historyPages,
+                        apiFetched: chainScan.apiChainsSeen,
+                        reused: Math.max(0, (chainScan.cacheCount || 0) - (chainScan.apiChainsSeen || 0)),
+                        missingRanges: chainScan.missingRangesFetched || 0,
+                        reportApiCalls: chainScan.reportApiCalls || 0,
+                        reportCacheHits: chainScan.reportCacheHits || 0
+                    } : null
                 }
             );
             await touchMasterCache(range, {
@@ -3244,26 +3220,41 @@
             const completedIn = formatScanDuration(Date.now() - scanStartedAt);
             const historyPagesFetched = num(attackScan.pageCount) + num(ocScan.pageCount) + num(armoryScan.pageCount) + (includeChains ? num(chainScan.historyPages) : 0);
             const historyRecordsReused = num(attackScan.cacheReuseCount) + num(ocScan.cacheReuseCount) + num(armoryScan.cacheReuseCount);
-            state.shareMessage = `Scan completed in ${completedIn}${includeChains ? ' with chains included' : ' without chains'} • ${historyPagesFetched} new history API page(s) • ${historyRecordsReused} cached record(s) reused.`;
+            state.shareMessage = `Scan completed in ${completedIn}${includeChains ? ` with chains • ${num(chainScan.reportApiCalls)} new chain report call(s) • ${num(chainScan.reportCacheHits)} chain report(s) reused` : ' without chains'} • ${historyPagesFetched} new history API page(s) • ${historyRecordsReused} cached record(s) reused.`;
             state.shareMessageType = '';
             state.lastAggregates = attackScan.aggregates;
             state.lastOcAggregates = ocScan.aggregates;
             state.lastArmoryXanaxAggregates = armoryScan.aggregates;
             state.scanProgress = null;
             state.scanError = '';
+            scanSucceeded = true;
         } catch (err) {
             state.scanError = err.message || String(err);
         } finally {
             state.scanRunning = false;
             state.abortScan = false;
             renderMain();
+            if (scanSucceeded) openMemberListPanel();
+            else if (document.getElementById('bftd-fws-members-panel')) renderMemberList();
         }
     }
 
+    function openMemberListPanel() {
+        const existing = document.getElementById('bftd-fws-members-panel');
+        if (existing) {
+            state.memberPanel = existing;
+            renderMemberList();
+            bringPanelFront(existing);
+            return;
+        }
+        state.memberPanel = panelShell('bftd-fws-members-panel', 'Faction Members', `${state.faction?.name || 'Faction'} • ${state.members.length} current`);
+        renderMemberList();
+    }
+
     function renderMemberList() {
-        const box = document.getElementById('bftd-fws-members');
-        const count = document.getElementById('bftd-fws-member-count');
-        if (!box || !count) return;
+        const panel = document.getElementById('bftd-fws-members-panel');
+        const body = panel?.querySelector('.bftd-fws-body');
+        if (!body) return;
 
         const range = getPresetRange();
         const cached = getCached(range);
@@ -3278,29 +3269,61 @@
                 || String(m.id || '').includes(q)
                 || String(m.position || '').toLowerCase().includes(q);
         });
-
-        count.textContent = ready
+        const status = ready
             ? `${filtered.length} member${filtered.length === 1 ? '' : 's'} shown • scan complete — click a member`
-            : `${filtered.length} member${filtered.length === 1 ? '' : 's'} shown • locked until Scan Faction completes`;
+            : `${filtered.length} member${filtered.length === 1 ? '' : 's'} shown • locked until Scan Faction completes for the selected range`;
 
-        box.innerHTML = filtered.map(m => `
-            <button class="bftd-fws-member" data-member-id="${esc(m.id)}" ${ready ? '' : 'disabled'}>
-                <div class="bftd-fws-row">
-                    <div class="bftd-fws-grow">
-                        <div class="bftd-fws-member-name">${esc(m.name)} [${esc(m.id)}]</div>
-                        <div class="bftd-fws-member-meta">
-                            ${esc(m.position || 'Member')} • Level ${esc(m.level ?? '?')} • ${esc(memberLastAction(m))}
-                        </div>
-                    </div>
-                    <span class="bftd-fws-badge ${String(m.last_action?.status || '').toLowerCase() === 'online' ? 'good' : ''}">
-                        ${ready ? esc(statusText(m)) : 'LOCKED'}
-                    </span>
+        body.innerHTML = `
+            <div class="bftd-fws-card">
+                <div class="bftd-fws-row" style="margin-bottom:8px">
+                    <input id="bftd-fws-search" class="bftd-fws-input bftd-fws-grow" placeholder="Search faction members…" value="${esc(state.search)}">
+                    <button id="bftd-fws-refresh-members" class="bftd-fws-btn secondary" title="Reload current faction member list" ${state.scanRunning ? 'disabled' : ''}>↻</button>
                 </div>
-            </button>
-        `).join('') || `<div class="bftd-fws-note">No matching faction members.</div>`;
+                <div id="bftd-fws-member-count" class="bftd-fws-note">${esc(status)}</div>
+            </div>
+            <div id="bftd-fws-members" class="bftd-fws-members">
+                ${filtered.map(m => `
+                    <button class="bftd-fws-member" data-member-id="${esc(m.id)}" ${ready ? '' : 'disabled'}>
+                        <div class="bftd-fws-row">
+                            <div class="bftd-fws-grow">
+                                <div class="bftd-fws-member-name">${esc(m.name)} [${esc(m.id)}]</div>
+                                <div class="bftd-fws-member-meta">
+                                    ${esc(m.position || 'Member')} • Level ${esc(m.level ?? '?')} • ${esc(memberLastAction(m))}
+                                </div>
+                            </div>
+                            <span class="bftd-fws-badge ${String(m.last_action?.status || '').toLowerCase() === 'online' ? 'good' : ''}">
+                                ${ready ? esc(statusText(m)) : 'LOCKED'}
+                            </span>
+                        </div>
+                    </button>
+                `).join('') || `<div class="bftd-fws-note">No matching faction members.</div>`}
+            </div>
+        `;
+
+        const search = body.querySelector('#bftd-fws-search');
+        search?.addEventListener('input', () => {
+            state.search = search.value;
+            renderMemberList();
+            const next = document.querySelector('#bftd-fws-members-panel #bftd-fws-search');
+            if (next) {
+                next.focus();
+                try { next.setSelectionRange(next.value.length, next.value.length); } catch {}
+            }
+        });
+
+        body.querySelector('#bftd-fws-refresh-members')?.addEventListener('click', async () => {
+            body.innerHTML = '<div class="bftd-fws-note">Reloading current faction members…</div>';
+            try {
+                await authenticateAndLoad();
+                renderMain();
+                renderMemberList();
+            } catch (err) {
+                body.innerHTML = `<div class="bftd-fws-error">${esc(err?.message || String(err))}</div>`;
+            }
+        });
 
         if (!ready) return;
-        box.querySelectorAll('[data-member-id]').forEach(btn => {
+        body.querySelectorAll('[data-member-id]').forEach(btn => {
             btn.addEventListener('click', () => {
                 const memberId = Number(btn.dataset.memberId);
                 const member = membersForDisplay.find(m => Number(m?.id) === memberId) || state.memberMap.get(memberId);
@@ -3494,15 +3517,152 @@
         };
     }
 
-    async function scanFactionChainHistory(range, onProgress) {
+
+    function extractChainReport(payload) {
+        return payload?.chainreport || payload?.chain_report || payload?.report || null;
+    }
+
+    function loadLegacyChainReportCache() {
+        try {
+            const raw = GM_getValue(APP.chainReportCacheStorage, '{}');
+            const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return obj && typeof obj === 'object' ? obj : {};
+        } catch {
+            return {};
+        }
+    }
+
+    async function getCachedChainReport(chainId, chainStart = 0) {
+        const master = await historyGetRecordById('chainReports', chainId);
+        if (master?.report) return master.report;
+        if (master && !master.report) return master;
+
+        // Migrate chain reports saved by older Faction Helper builds into the
+        // authoritative Master Data Cache instead of downloading them again.
+        const legacy = loadLegacyChainReportCache()[String(chainId)] || null;
+        if (legacy) await putCachedChainReport(chainId, legacy, chainStart || legacy?.start);
+        return legacy;
+    }
+
+    async function putCachedChainReport(chainId, report, chainStart = 0) {
+        if (!report) return;
+        const ts = Math.floor(num(chainStart || report?.start)) || Math.floor(Date.now() / 1000);
+        await historyPutRecords(
+            'chainReports',
+            [{ id: String(chainId), ts, report }],
+            row => row.id,
+            row => row.ts
+        );
+    }
+
+    function chainReportAttackValue(attacks, ...keys) {
+        for (const key of keys) {
+            if (attacks?.[key] !== undefined && attacks?.[key] !== null) return num(attacks[key], 0);
+        }
+        return 0;
+    }
+
+    function normalizeChainReportMember(chain, report, attacker) {
+        const attacks = attacker?.attacks || {};
+        const respect = attacker?.respect || {};
+        const leave = chainReportAttackValue(attacks, 'leave', 'leaves');
+        const mug = chainReportAttackValue(attacks, 'mug', 'mugs');
+        const hosp = chainReportAttackValue(attacks, 'hospitalize', 'hospitalized', 'hospitalise', 'hosp');
+        return {
+            id: chain.id,
+            start: num(report?.start, chain.start),
+            end: num(report?.end, chain.end),
+            chain: num(report?.details?.chain, chain.chain),
+            factionRespect: num(report?.details?.respect, chain.respect),
+            hits: leave + mug + hosp,
+            respect: num(respect?.total, 0),
+            best: num(respect?.best, 0),
+            avg: num(respect?.average ?? respect?.avg, 0),
+            attacks: chainReportAttackValue(attacks, 'total', 'attacks'),
+            leave,
+            mug,
+            hosp,
+            war: chainReportAttackValue(attacks, 'war', 'war_hits', 'warHits'),
+            assist: chainReportAttackValue(attacks, 'assists', 'assist'),
+            retal: chainReportAttackValue(attacks, 'retaliations', 'retaliation', 'retals', 'retal'),
+            overseas: chainReportAttackValue(attacks, 'overseas', 'abroad'),
+            draw: chainReportAttackValue(attacks, 'draws', 'draw', 'stalemates', 'stalemate'),
+            escape: chainReportAttackValue(attacks, 'escapes', 'escape'),
+            loss: chainReportAttackValue(attacks, 'losses', 'loss')
+        };
+    }
+
+    async function buildChainSummaryFromMaster(chainScan, reportApiCalls = 0, reportCacheHits = 0) {
+        const memberParticipation = {};
+        const chains = Array.isArray(chainScan?.chains) ? chainScan.chains : [];
+        for (const chain of chains) {
+            const report = await getCachedChainReport(chain.id, chain.start);
+            if (!report) continue;
+            const attackers = Array.isArray(report?.attackers) ? report.attackers : Object.values(report?.attackers || {});
+            for (const attacker of attackers) {
+                const uid = num(attacker?.id, 0);
+                if (!uid) continue;
+                if (!memberParticipation[uid]) memberParticipation[uid] = [];
+                memberParticipation[uid].push(normalizeChainReportMember(chain, report, attacker));
+            }
+        }
+        for (const rows of Object.values(memberParticipation)) rows.sort((a, b) => num(a.start) - num(b.start));
+        return {
+            chainCount: chains.length,
+            historyPages: num(chainScan?.historyPages),
+            reportApiCalls,
+            reportCacheHits,
+            derivedFromReports: true,
+            chains,
+            memberParticipation
+        };
+    }
+
+    async function scanFactionChainsAndReports(range, onProgress, plannedMissingRanges = null) {
+        const chainScan = await scanFactionChainHistory(range, (pages, chainsFound, totalRanges, currentRange) => {
+            onProgress?.({ phase: 'history', pages, chainsFound, totalRanges, currentRange, done: 0, total: 0, apiCalls: 0, cacheHits: 0 });
+        }, plannedMissingRanges);
+
+        let reportApiCalls = 0;
+        let reportCacheHits = 0;
+        let done = 0;
+        const chains = Array.isArray(chainScan?.chains) ? chainScan.chains : [];
+
+        for (const chain of chains) {
+            if (state.abortScan) throw new Error('Scan cancelled.');
+            let report = await getCachedChainReport(chain.id, chain.start);
+            if (report) {
+                reportCacheHits += 1;
+            } else {
+                const payload = await gmJsonWithMinDelay(
+                    apiUrl(`/faction/${encodeURIComponent(chain.id)}/chainreport`),
+                    APP.chainReportDelayMs
+                );
+                report = extractChainReport(payload);
+                reportApiCalls += 1;
+                if (report) await putCachedChainReport(chain.id, report, chain.start);
+            }
+            done += 1;
+            onProgress?.({ phase: 'reports', pages: chainScan.historyPages, chainsFound: chains.length, done, total: chains.length, apiCalls: reportApiCalls, cacheHits: reportCacheHits });
+        }
+
+        // Build the finished chain dataset only from the Master Data Cache after all
+        // missing reports have been fetched and written there.
+        const summary = await buildChainSummaryFromMaster(chainScan, reportApiCalls, reportCacheHits);
+        return { ...chainScan, summary, reportApiCalls, reportCacheHits };
+    }
+
+    async function scanFactionChainHistory(range, onProgress, plannedMissingRanges = null) {
         const now = Math.floor(Date.now() / 1000);
         // /faction/chains can temporarily omit a just-finished chain while it is still cooling down.
         // Keep the most recent 15 minutes refreshable instead of permanently marking that tail as complete.
         const stableTo = Math.min(range.to, now - 15 * 60);
-        const fetchRanges = stableTo >= range.from
-            ? await historyMissingRanges('chains', range.from, stableTo)
-            : [];
-        if (range.to > stableTo) fetchRanges.push([Math.max(range.from, stableTo + 1), range.to]);
+        // The scan preflight decides which exact chain intervals are not covered by
+        // the Master Data Cache. The newest cooldown tail intentionally remains
+        // uncovered until it is old enough to be considered stable.
+        const fetchRanges = plannedMissingRanges === null
+            ? await historyMissingRanges('chains', range.from, range.to)
+            : cloneMissingRanges(plannedMissingRanges);
 
         let historyPages = 0;
         let apiChainsSeen = 0;
@@ -3565,7 +3725,7 @@
         }
 
         const cachedChains = await historyGetRecords('chains', range.from, range.to);
-        const selected = [...cachedChains, ...fetchedChains]
+        const selected = cachedChains
             .map(normalizeChain)
             .filter(chain => chain.id && chain.start >= range.from && chain.start <= range.to)
             .sort((a, b) => a.start - b.start);
@@ -3585,154 +3745,6 @@
         };
     }
 
-    function attackChainPosition(attack) {
-        return num(attack?.chain ?? attack?.chain_count ?? attack?.chain_position, 0);
-    }
-
-    function findChainForAttack(attack, chains) {
-        const ts = attackEndTs(attack);
-        if (!ts || !Array.isArray(chains) || !chains.length) return null;
-        const position = attackChainPosition(attack);
-        let lo = 0;
-        let hi = chains.length - 1;
-        let candidate = -1;
-        while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            if (num(chains[mid]?.start) <= ts) {
-                candidate = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        if (candidate < 0) return null;
-
-        // A completed faction can only have one active chain at a time. Search the nearest
-        // candidate first and allow only a two-second end tolerance for Torn's documented
-        // one-second /chains vs /attacks final-hit timestamp discrepancy.
-        for (let i = candidate; i >= Math.max(0, candidate - 1); i--) {
-            const chain = chains[i];
-            const start = num(chain?.start);
-            const end = num(chain?.end);
-            const finalSize = num(chain?.chain);
-            if (!start || ts < start) continue;
-            if (end && ts > end + 2) continue;
-            if (position > 0 && finalSize > 0 && position > finalSize) continue;
-            return chain;
-        }
-        return null;
-    }
-
-    function createLocalChainCollector(chains, wars = []) {
-        return {
-            chains: (Array.isArray(chains) ? chains : []).slice().sort((a, b) => num(a?.start) - num(b?.start)),
-            wars: Array.isArray(wars) ? wars : [],
-            byMember: Object.create(null)
-        };
-    }
-
-    function ensureLocalChainRow(collector, memberId, chain) {
-        if (!collector.byMember[memberId]) collector.byMember[memberId] = Object.create(null);
-        const memberRows = collector.byMember[memberId];
-        if (!memberRows[chain.id]) {
-            memberRows[chain.id] = {
-                id: chain.id,
-                start: chain.start,
-                end: chain.end,
-                chain: chain.chain,
-                factionRespect: chain.respect,
-                hits: 0,
-                warTargetHits: 0,
-                outsideHits: 0,
-                totalAttacks: 0,
-                respect: 0,
-                assists: 0,
-                losses: 0,
-                _seenAttackIds: new Set()
-            };
-        }
-        return memberRows[chain.id];
-    }
-
-    function addAttackToLocalChainCollector(collector, attack) {
-        if (!collector?.chains?.length) return;
-        const uid = attackerId(attack);
-        if (!uid) return;
-
-        const chain = findChainForAttack(attack, collector.chains);
-        if (!chain) return;
-        const row = ensureLocalChainRow(collector, uid, chain);
-
-        const attackIdValue = String(attackId(attack, '') || '');
-        if (attackIdValue && row._seenAttackIds.has(attackIdValue)) return;
-        if (attackIdValue) row._seenAttackIds.add(attackIdValue);
-        row.totalAttacks += 1;
-
-        const result = attackResult(attack).toLowerCase();
-        const interrupted = attack?.is_interrupted === true || result === 'interrupted';
-        const assist = result === 'assist';
-        const respectGain = num(attack?.respect_gain ?? attack?.respect, 0);
-        const chainPosition = attackChainPosition(attack);
-        const validResult = !assist && !interrupted && !FAILURE_RESULTS.has(result)
-            && (SUCCESS_RESULTS.has(result) || respectGain > 0);
-
-        if (assist) row.assists += 1;
-        if (result === 'lost') row.losses += 1;
-
-        // MEMBER HITS is deliberately strict: the outgoing faction attack must be a valid
-        // successful result AND Torn itself must assign a positive chain position. This
-        // prevents assists, losses, escapes, stalemates and ordinary attacks during the
-        // chain window from being counted as chain participation.
-        if (validResult && chainPosition > 0) {
-            row.hits += 1;
-            row.respect += respectGain;
-            const defenderFaction = defenderFactionId(attack);
-            const targetWar = targetWarForAttack(attackEndTs(attack), defenderFaction, collector.wars || []);
-            if (targetWar) row.warTargetHits += 1;
-            else row.outsideHits += 1;
-        }
-    }
-
-    function finalizeLocalChainSummary(chainScan, collector) {
-        const memberParticipation = {};
-        for (const [uid, rowsByChain] of Object.entries(collector?.byMember || {})) {
-            const rows = Object.values(rowsByChain)
-                // Participation means the member actually contributed >= 1 Torn-marked chain hit.
-                .filter(row => num(row.hits) > 0)
-                .map(row => {
-                    const { _seenAttackIds, ...clean } = row;
-                    return clean;
-                })
-                .sort((a, b) => num(a.start) - num(b.start));
-            if (rows.length) memberParticipation[uid] = rows;
-        }
-        return {
-            chainCount: chainScan?.chains?.length || 0,
-            historyPages: chainScan?.historyPages || 0,
-            reportApiCalls: 0,
-            reportCacheHits: 0,
-            derivedFromAttacks: true,
-            validation: 'strict-outgoing-success-positive-chain-position',
-            chains: chainScan?.chains || [],
-            memberParticipation
-        };
-    }
-
-    function buildAccurateLocalChainSummary(chainScan, attacks, range, wars = []) {
-        const collector = createLocalChainCollector(chainScan?.chains || [], wars);
-        const from = num(range?.from);
-        const to = num(range?.to);
-        const seen = new Set();
-        for (const attack of (Array.isArray(attacks) ? attacks : [])) {
-            const ts = attackEndTs(attack);
-            if (!ts || (from && ts < from) || (to && ts > to)) continue;
-            const id = String(attackId(attack, '') || '');
-            if (id && seen.has(id)) continue;
-            if (id) seen.add(id);
-            addAttackToLocalChainCollector(collector, attack);
-        }
-        return finalizeLocalChainSummary(chainScan, collector);
-    }
 
     function extractRankedWars(payload) {
         if (Array.isArray(payload?.rankedwars)) return payload.rankedwars;
@@ -3770,14 +3782,16 @@
         return { reportAttacks: 0, warScore: 0, wars: {} };
     }
 
-    async function scanRankedWarsAndReports(range, onProgress) {
+    async function scanRankedWarsAndReports(range, onProgress, plannedMissingRanges = null) {
         let historyPages = 0;
         let reportApiCalls = 0;
         let reportCacheHits = 0;
 
         // Ranked-war rows are part of the master cache too. Only walk Torn's
         // ranked-war history when some part of this exact date range is missing.
-        const missingRanges = await historyMissingRanges('wars', range.from, range.to);
+        const missingRanges = plannedMissingRanges === null
+            ? await historyMissingRanges('wars', range.from, range.to)
+            : cloneMissingRanges(plannedMissingRanges);
         if (missingRanges.length) {
             const earliestNeeded = Math.min(...missingRanges.map(row => num(row?.[0])).filter(Boolean));
             let offset = 0;
@@ -3816,17 +3830,10 @@
             }
         }
 
-        // For a range ending very recently, refresh the newest ranked-war page so
-        // an active/recently-ended war can update its end/winner without throwing
-        // away the historical cache. This is at most one extra request.
-        const now = Math.floor(Date.now() / 1000);
-        if (!missingRanges.length && range.to >= now - 24 * 60 * 60) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
-            const payload = await gmJson(apiUrl('/faction/rankedwars', { limit: 100, offset: 0 }));
-            historyPages += 1;
-            const normalized = extractRankedWars(payload).map(normalizeWar).filter(w => w.id && w.start);
-            if (normalized.length) await historyPutRecords('wars', normalized, row => row.id, row => row.start);
-        }
+        // Do not make a "just in case" ranked-war refresh when the selected
+        // interval is already covered. A later scan whose End time moves forward
+        // creates a new uncovered tail and will refresh the newest ranked-war page
+        // as part of that missing interval instead.
 
         const cachedWars = await historyGetRecords('wars', range.from, range.to);
         const byId = new Map();
@@ -4127,12 +4134,14 @@
         };
     }
 
-    async function scanFactionAttacks(range, wars, reportStats, onProgress) {
+    async function scanFactionAttacks(range, wars, reportStats, onProgress, plannedMissingRanges = null) {
         const aggregates = {};
         applyReportStats(aggregates, wars, reportStats);
         let pageCount = 0;
         const fetchedRows = [];
-        const missingRanges = await historyMissingRanges('attacks', range.from, range.to);
+        const missingRanges = plannedMissingRanges === null
+            ? await historyMissingRanges('attacks', range.from, range.to)
+            : cloneMissingRanges(plannedMissingRanges);
 
         for (let r = 0; r < missingRanges.length; r++) {
             const [gapFrom, gapTo] = missingRanges[r];
@@ -4206,10 +4215,12 @@
             if (gapComplete) await historyMarkCoverage('attacks', gapFrom, gapTo);
         }
 
+        // The finished period is always rebuilt from the Master Data Cache after
+        // any missing pages have been written there. Live API rows are never used
+        // as a separate second source of truth.
         const cachedRows = await historyGetRecords('attacks', range.from, range.to);
         const allById = new Map();
         for (const row of cachedRows) if (row?.id) allById.set(String(row.id), row);
-        for (const row of fetchedRows) if (row?.id) allById.set(String(row.id), row);
         const allAttacks = Array.from(allById.values()).sort((a, b) => num(a.ended) - num(b.ended));
         const fetchedIdSet = new Set(fetchedRows.map(row => String(row.id)));
         const cacheReuseCount = allAttacks.reduce((n, row) => n + (fetchedIdSet.has(String(row.id)) ? 0 : 1), 0);
@@ -4286,13 +4297,15 @@
         };
     }
 
-    async function scanFactionCrimes(range, onProgress) {
+    async function scanFactionCrimes(range, onProgress, plannedMissingRanges = null) {
         const aggregates = {};
         for (const member of state.members) aggregates[Number(member.id)] = freshOcAgg();
 
         let pageCount = 0;
         const fetchedRows = [];
-        const missingRanges = await historyMissingRanges('crimes', range.from, range.to);
+        const missingRanges = plannedMissingRanges === null
+            ? await historyMissingRanges('crimes', range.from, range.to)
+            : cloneMissingRanges(plannedMissingRanges);
 
         for (let r = 0; r < missingRanges.length; r++) {
             const [gapFrom, gapTo] = missingRanges[r];
@@ -4344,7 +4357,6 @@
         const cachedRows = await historyGetRecords('crimes', range.from, range.to);
         const allById = new Map();
         for (const row of cachedRows) if (row?.id) allById.set(String(row.id), row);
-        for (const row of fetchedRows) if (row?.id) allById.set(String(row.id), row);
         const allCrimes = Array.from(allById.values()).sort((a, b) => num(a.executed_at) - num(b.executed_at));
         const fetchedIdSet = new Set(fetchedRows.map(row => String(row.id)));
         const cacheReuseCount = allCrimes.reduce((n, row) => n + (fetchedIdSet.has(String(row.id)) ? 0 : 1), 0);
@@ -4473,13 +4485,15 @@
         };
     }
 
-    async function scanFactionArmoryXanax(range, onProgress) {
+    async function scanFactionArmoryXanax(range, onProgress, plannedMissingRanges = null) {
         const aggregates = {};
         for (const member of state.members) aggregates[Number(member.id)] = freshArmoryXanaxAgg();
 
         let pageCount = 0;
         const fetchedRows = [];
-        const missingRanges = await historyMissingRanges('armory', range.from, range.to);
+        const missingRanges = plannedMissingRanges === null
+            ? await historyMissingRanges('armory', range.from, range.to)
+            : cloneMissingRanges(plannedMissingRanges);
 
         for (let r = 0; r < missingRanges.length; r++) {
             const [gapFrom, gapTo] = missingRanges[r];
@@ -4531,7 +4545,6 @@
         const cachedRows = await historyGetRecords('armory', range.from, range.to);
         const allById = new Map();
         for (const row of cachedRows) if (row?.id) allById.set(String(row.id), row);
-        for (const row of fetchedRows) if (row?.id) allById.set(String(row.id), row);
         const allNews = Array.from(allById.values()).sort((a, b) => num(a.timestamp) - num(b.timestamp));
         const fetchedIdSet = new Set(fetchedRows.map(row => String(row.id)));
         const cacheReuseCount = allNews.reduce((n, row) => n + (fetchedIdSet.has(String(row.id)) ? 0 : 1), 0);
@@ -4758,17 +4771,27 @@ ${clone.outerHTML}
             .slice()
             .sort((a, b) => num(a.start) - num(b.start))
             .map(c => {
-                const hasSplit = Number.isFinite(Number(c.warTargetHits)) && Number.isFinite(Number(c.outsideHits));
+                const hasReportData = c.attacks !== undefined || c.leave !== undefined || c.best !== undefined;
+                const val = (value, decimals = 0) => hasReportData ? fmt(value, decimals) : '—';
                 return `
                 <tr>
-                    <td>#${esc(c.id)}<div class="bftd-fws-note">${esc(dateTime(c.start))} → ${esc(dateTime(c.end))}</div></td>
-                    <td>${fmt(c.chain)}</td>
-                    <td>${hasSplit ? fmt(c.warTargetHits) : '—'}</td>
-                    <td>${hasSplit ? fmt(c.outsideHits) : '—'}</td>
-                    <td>${fmt(c.respect, 2)}</td>
-                </tr>
-            `;
-            }).join('') || `<tr><td colspan="5">${chainSummaryAvailable ? 'No completed-chain participation was found for this member in the selected period.' : 'Chain participation was not included in this saved scan. Run this period again to add chain data.'}</td></tr>`;
+                    <td><b>${esc(dateTime(c.start))}</b><div class="bftd-fws-note">${esc(dateTime(c.end))} • Chain #${esc(c.id)}</div></td>
+                    <td>${val(c.respect, 2)}</td>
+                    <td>${val(c.best, 2)}</td>
+                    <td>${val(c.avg, 2)}</td>
+                    <td>${val(c.attacks)}</td>
+                    <td>${val(c.leave)}</td>
+                    <td>${val(c.mug)}</td>
+                    <td>${val(c.hosp)}</td>
+                    <td>${val(c.war)}</td>
+                    <td>${val(c.assist)}</td>
+                    <td>${val(c.retal)}</td>
+                    <td>${val(c.overseas)}</td>
+                    <td>${val(c.draw)}</td>
+                    <td>${val(c.escape)}</td>
+                    <td>${val(c.loss)}</td>
+                </tr>`;
+            }).join('') || `<tr><td colspan="15">${chainSummaryAvailable ? 'No completed-chain participation was found for this member in the selected period.' : 'Chain participation was not included in this saved scan. Enable Include Chains and rescan this period to add chain-report data.'}</td></tr>`;
 
         const warRows = Object.values(s.warBreakdown || {})
             .sort((a, b) => num(a.start) - num(b.start))
@@ -4886,12 +4909,12 @@ ${clone.outerHTML}
                     <div class="bftd-fws-stat"><div class="v">${chainSummaryAvailable ? fmt(meta.chainSummary?.chainCount || 0) : '—'}</div><div class="k">FACTION CHAINS IN PERIOD</div></div>
                 </div>
                 <div style="overflow:auto">
-                    <table class="bftd-fws-table" style="min-width:650px">
-                        <thead><tr><th>CHAIN / DATE</th><th>CHAIN SIZE</th><th>WAR TARGET HITS</th><th>OUTSIDE HITS</th><th>CHAIN-HIT RESPECT</th></tr></thead>
+                    <table class="bftd-fws-table" style="min-width:1320px">
+                        <thead><tr><th>DATE / TIME</th><th>RESPECT</th><th>BEST</th><th>AVG</th><th>ATTACKS</th><th>LEAVE</th><th>MUG</th><th>HOSP</th><th>WAR</th><th>ASSIST</th><th>RETAL</th><th>OVERSEAS</th><th>DRAW</th><th>ESCAPE</th><th>LOSS</th></tr></thead>
                         <tbody>${chainRows}</tbody>
                     </table>
                 </div>
-                <div class="bftd-fws-note" style="margin-top:8px">Chain participation is rebuilt locally after the detailed attack scan. WAR TARGET HITS are validated chain hits against the active ranked-war opponent. OUTSIDE HITS are all other validated chain hits. CHAIN-HIT RESPECT is the respect earned from those validated chain hits.</div>
+                <div class="bftd-fws-note" style="margin-top:8px">Chain rows now come directly from Torn's per-chain reports. Missing reports are fetched once at the 2-second report pace and stored permanently in the Master Data Cache for reuse.</div>
             </div>
 
             <div class="bftd-fws-card">
@@ -4921,7 +4944,7 @@ ${clone.outerHTML}
                     Xanax snapshot totals: ${xanaxLoaded ? `<b>${fmt(xanax.startTotal)}</b> → <b>${fmt(xanax.endTotal)}</b>` : '<b>Not loaded — use the button below to spend 2 API calls.</b>'}<br>
                     Faction armory Xanax: <b>${fmt(armoryXanax.used || 0)}</b> across <b>${fmt(armoryXanax.events || 0)}</b> armory log event(s)<br>
                     Ranked-war scan: <b>${fmt(meta.warSummary?.warCount || 0)}</b> wars; <b>${fmt(meta.warSummary?.historyPages || 0)}</b> history page(s); <b>${fmt(meta.warSummary?.reportApiCalls || 0)}</b> new war-report API call(s); <b>${fmt(meta.warSummary?.reportCacheHits || 0)}</b> cached war report(s)<br>
-                    Chain scan: ${chainSummaryAvailable ? `<b>${fmt(meta.chainSummary?.chainCount || 0)}</b> completed chain(s); <b>${fmt(meta.chainSummary?.historyPages || 0)}</b> new chain-history API page(s); <b>0</b> per-chain report calls; participation strictly validated locally from the completed attack data` : '<b>Not included in this saved scan</b>'}<br>
+                    Chain scan: ${chainSummaryAvailable ? `<b>${fmt(meta.chainSummary?.chainCount || 0)}</b> completed chain(s); <b>${fmt(meta.chainSummary?.historyPages || 0)}</b> new chain-history API page(s); <b>${fmt(meta.chainSummary?.reportApiCalls || 0)}</b> new chain-report call(s); <b>${fmt(meta.chainSummary?.reportCacheHits || 0)}</b> chain report(s) reused from the Master Cache` : '<b>Not included in this saved scan</b>'}<br>
                     Local history reuse: <b>${fmt(meta.historyCacheStats?.attacks?.reused || 0)}</b> attack(s), <b>${fmt(meta.historyCacheStats?.crimes?.reused || 0)}</b> OC(s), <b>${fmt(meta.historyCacheStats?.armory?.reused || 0)}</b> armory record(s)<br>
                     Attack scan: <b>${fmt(meta.pageCount)}</b> new API page(s) / <b>${fmt(meta.fetchedCount)}</b> outgoing attacks checked<br>
                     OC scan: <b>${fmt(meta.ocPageCount)}</b> new API page(s) / <b>${fmt(meta.ocCount)}</b> completed OCs checked<br>
