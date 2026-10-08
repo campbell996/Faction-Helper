@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.6.0
-// @description  Faction scanner with reusable local history caching, low-API chain analysis, preset/custom time ranges, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
+// @version      1.7.0
+// @description  Faction scanner with one flexible start/end range, quick 1M/3M/6M/12M range presets, local cached scans/history, low-API chain analysis, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
 // @connect      api.torn.com
@@ -18,7 +18,7 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.6.0',
+        version: '1.7.0',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
@@ -42,7 +42,7 @@
         faction: null,
         members: [],
         memberMap: new Map(),
-        selectedPreset: '6m',
+        selectedPreset: 'custom',
         customStart: '',
         customEnd: '',
         includeChains: Boolean(GM_getValue('bftd_fh_include_chains_v1', false)),
@@ -50,6 +50,7 @@
         currentMember: null,
         mainPanel: null,
         statsPanel: null,
+        cachedPanel: null,
         launcher: null,
         loadingStats: false,
         scanRunning: false,
@@ -601,6 +602,12 @@
                 top: 100px;
                 left: 30px;
             }
+            #bftd-fws-cache {
+                width: 540px;
+                height: 560px;
+                top: 120px;
+                left: 80px;
+            }
             .bftd-fws-head {
                 height: 42px;
                 display: flex;
@@ -817,7 +824,7 @@
             @keyframes bftdFwsSlide { from{ transform:translateX(-100%);} to{transform:translateX(300%);} }
             @media (max-width: 700px) {
                 .bftd-fws-custom-dates { grid-template-columns:1fr; }
-                #bftd-fws-main, #bftd-fws-stats {
+                #bftd-fws-main, #bftd-fws-stats, #bftd-fws-cache {
                     width: calc(100vw - 18px) !important;
                     height: calc(100vh - 30px) !important;
                     top: 10px !important;
@@ -1676,7 +1683,7 @@
         const d = dateOrTs instanceof Date ? new Date(dateOrTs.getTime()) : new Date(Number(dateOrTs));
         if (!Number.isFinite(d.getTime())) return '';
         const pad = n => String(n).padStart(2, '0');
-        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     }
 
     function parseLocalDateTimeInput(value) {
@@ -1716,30 +1723,35 @@
         return { valid:true, start, end, maxEnd };
     }
 
-    function getPresetRange(code = state.selectedPreset) {
-        if (code === 'custom') {
-            const validation = customRangeValidation();
-            if (!validation.valid) {
-                return { code:'custom', label:'Custom time period', from:0, to:0, valid:false, validationMessage:validation.message };
-            }
-            return {
-                code:'custom',
-                label:'Custom time period',
-                from: Math.floor(validation.start.getTime() / 1000),
-                to: Math.floor(validation.end.getTime() / 1000),
-                valid:true
-            };
-        }
-
+    function ensureScanRangeInitialized() {
+        if (parseLocalDateTimeInput(state.customStart) && parseLocalDateTimeInput(state.customEnd)) return;
         const end = new Date();
-        const start = new Date(end);
-        const months = ({ '1m': 1, '3m': 3, '6m': 6, '12m': 12 }[code] || 6);
-        start.setMonth(start.getMonth() - months);
+        end.setMilliseconds(0);
+        const start = addCalendarMonthsClamped(end, -6);
+        state.customStart = localDateTimeInputValue(start);
+        state.customEnd = localDateTimeInputValue(end);
+    }
+
+    function applyQuickRange(months) {
+        const end = new Date();
+        end.setMilliseconds(0);
+        const start = addCalendarMonthsClamped(end, -Math.max(1, Number(months || 1)));
+        state.customStart = localDateTimeInputValue(start);
+        state.customEnd = localDateTimeInputValue(end);
+        state.selectedPreset = 'custom';
+    }
+
+    function getPresetRange() {
+        ensureScanRangeInitialized();
+        const validation = customRangeValidation();
+        if (!validation.valid) {
+            return { code:'custom', label:'Selected time period', from:0, to:0, valid:false, validationMessage:validation.message };
+        }
         return {
-            code,
-            label: `${months} month${months === 1 ? '' : 's'}`,
-            from: Math.floor(start.getTime() / 1000),
-            to: Math.floor(end.getTime() / 1000),
+            code:'custom',
+            label:'Selected time period',
+            from: Math.floor(validation.start.getTime() / 1000),
+            to: Math.floor(validation.end.getTime() / 1000),
             valid:true
         };
     }
@@ -2493,12 +2505,12 @@
 
     async function exportSelectedScan() {
         const requestedRange = getPresetRange();
-        if (requestedRange.code === 'custom' && !requestedRange.valid) {
-            throw new Error(requestedRange.validationMessage || 'Choose a valid custom time period first.');
+        if (!requestedRange.valid) {
+            throw new Error(requestedRange.validationMessage || 'Choose a valid start and end date/time first.');
         }
         const cached = getCached(requestedRange);
         if (!cached?.aggregates || !cached?.ocAggregates || !cached?.armoryXanaxAggregates || !cached?.warSummary) {
-            throw new Error(`No completed ${requestedRange.code.toUpperCase()} scan is available to download.`);
+            throw new Error('No completed scan is available for the selected start/end range.');
         }
 
         const range = cached.range || requestedRange;
@@ -2521,7 +2533,7 @@
                 id: Number(state.faction?.id || 0),
                 name: String(state.faction?.name || '')
             },
-            period: range.code,
+            period: 'custom',
             scan: {
                 ...cached,
                 membersSnapshot
@@ -2532,17 +2544,15 @@
 
         const factionPart = safeDownloadName(state.faction?.name || `Faction_${state.faction?.id || 0}`);
         const stamp = new Date(cached.generatedAt || Date.now()).toISOString().replace(/[:.]/g, '-');
-        const rangePart = range.code === 'custom'
-            ? `CUSTOM_${new Date(range.from * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}_to_${new Date(range.to * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}`
-            : String(range.code).toUpperCase();
+        const rangePart = `RANGE_${new Date(range.from * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}_to_${new Date(range.to * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}`;
         const filename = `Faction_Helper_${factionPart}_${rangePart}_${stamp}.json`;
         downloadTextFile(filename, JSON.stringify(payload));
-        state.shareMessage = `${range.code === 'custom' ? 'Custom' : String(range.code).toUpperCase()} scan downloaded and ready to share.`;
+        state.shareMessage = 'Selected-range scan downloaded and ready to share.';
         state.shareMessageType = 'ok';
         renderMain();
     }
 
-    function validateImportedScan(payload, expectedCode) {
+    function validateImportedScan(payload) {
         if (!payload || payload.kind !== 'FactionHelperScan' || ![1,2].includes(Number(payload.schemaVersion))) {
             throw new Error('This is not a valid Faction Helper scan-share file.');
         }
@@ -2553,29 +2563,20 @@
 
         const scan = payload.scan;
         if (!scan || typeof scan !== 'object') throw new Error('The scan-share file is missing its scan data.');
-        const code = String(scan?.range?.code || payload.period || '').toLowerCase();
-        if (!['1m','3m','6m','12m','custom'].includes(code)) throw new Error('The scan-share file has an invalid scan period.');
-        if (code !== String(expectedCode || '').toLowerCase()) {
-            throw new Error(`This file contains a ${code.toUpperCase()} scan. Select ${code.toUpperCase()} on the main panel, then upload it.`);
-        }
-
         const from = Math.floor(num(scan?.range?.from));
         const to = Math.floor(num(scan?.range?.to));
         if (!from || !to || from >= to) throw new Error('The scan-share file has an invalid date range.');
-        if (code === 'custom') {
-            const startDate = new Date(from * 1000);
-            const maxEnd = addCalendarMonthsClamped(startDate, 60);
-            if (to * 1000 > maxEnd.getTime()) throw new Error('This custom scan is longer than the 60-month maximum.');
-        }
+        const startDate = new Date(from * 1000);
+        const maxEnd = addCalendarMonthsClamped(startDate, 60);
+        if (to * 1000 > maxEnd.getTime()) throw new Error('This scan is longer than the 60-month maximum.');
         if (!scan.aggregates || typeof scan.aggregates !== 'object') throw new Error('The scan-share file is missing attack aggregates.');
         if (!scan.ocAggregates || typeof scan.ocAggregates !== 'object') throw new Error('The scan-share file is missing OC aggregates.');
         if (!scan.armoryXanaxAggregates || typeof scan.armoryXanaxAggregates !== 'object') throw new Error('The scan-share file is missing armory Xanax aggregates.');
         if (!scan.warSummary || typeof scan.warSummary !== 'object') throw new Error('The scan-share file is missing ranked-war data.');
 
-        const months = ({ '1m':1, '3m':3, '6m':6, '12m':12 })[code];
         const range = {
-            code,
-            label: code === 'custom' ? 'Custom time period' : `${months} month${months === 1 ? '' : 's'}`,
+            code:'custom',
+            label:'Selected time period',
             from,
             to,
             valid:true
@@ -2584,12 +2585,11 @@
             ? scan.membersSnapshot.filter(m => Number(m?.id) > 0)
             : [];
 
-        return { scan, range, membersSnapshot, code };
+        return { scan, range, membersSnapshot, code:'custom' };
     }
 
     async function importSelectedScan(file) {
         if (!file) return;
-        const selectedCode = state.selectedPreset;
         let payload;
         try {
             payload = JSON.parse(await file.text());
@@ -2597,11 +2597,9 @@
             throw new Error('The selected file is not valid JSON.');
         }
 
-        const { scan, range, membersSnapshot, code } = validateImportedScan(payload, selectedCode);
-        if (code === 'custom') {
-            state.customStart = localDateTimeInputValue(range.from * 1000);
-            state.customEnd = localDateTimeInputValue(range.to * 1000);
-        }
+        const { scan, range, membersSnapshot, code } = validateImportedScan(payload);
+        state.customStart = localDateTimeInputValue(range.from * 1000);
+        state.customEnd = localDateTimeInputValue(range.to * 1000);
         const importedEntry = {
             generatedAt: num(scan.generatedAt, Date.now()),
             range,
@@ -2653,9 +2651,10 @@
         document.getElementById('bftd-fws-stats')?.remove();
         state.statsPanel = null;
         state.scanError = '';
-        state.shareMessage = `${code === 'custom' ? 'Custom' : code.toUpperCase()} shared scan imported. No faction rescan is required for this period.`;
+        state.shareMessage = 'Shared scan imported and loaded for this exact start/end range. No faction rescan is required.';
         state.shareMessageType = 'ok';
         renderMain();
+        if (document.getElementById('bftd-fws-cache')) renderCachedScansPanel();
     }
 
     function renderMain() {
@@ -2663,8 +2662,9 @@
         if (!body) return;
 
         const accessType = state.keyInfo?.access?.type || 'API key';
+        ensureScanRangeInitialized();
         const requestedRange = getPresetRange();
-        const customValidation = state.selectedPreset === 'custom' ? customRangeValidation() : { valid:true };
+        const customValidation = customRangeValidation();
         const customStartDate = parseLocalDateTimeInput(state.customStart);
         const customMaxEnd = customStartDate ? addCalendarMonthsClamped(customStartDate, 60) : null;
         const cached = requestedRange.valid !== false ? getCached(requestedRange) : null;
@@ -2675,7 +2675,7 @@
             ? (state.scanProgress?.message || 'Scanning faction data…')
             : ready
                 ? `Scan ready • ${cached.warSummary?.warCount || 0} ranked war(s) • ${cached.chainSummary ? 'chains included' : 'chains not included'}${cached.scanDurationMs ? ` • completed in ${formatScanDuration(cached.scanDurationMs)}` : ''} • ${new Date(cached.generatedAt).toLocaleString()}${cached.importedAt ? ` • imported ${new Date(cached.importedAt).toLocaleString()}` : ''}`
-                : 'No completed scan for this period. Members are locked until the scan finishes.';
+                : 'No completed scan for this exact Start/End range. Members are locked until the scan finishes.';
 
         body.innerHTML = `
             <div class="bftd-fws-card">
@@ -2689,36 +2689,35 @@
             </div>
 
             <div class="bftd-fws-card">
-                <div class="bftd-fws-note" style="margin-bottom:6px">SCAN PERIOD</div>
-                <div class="bftd-fws-periods">
-                    ${['1m','3m','6m','12m','custom'].map(code => `
-                        <button class="bftd-fws-period ${state.selectedPreset === code ? 'active' : ''}" data-period="${code}" ${state.scanRunning ? 'disabled' : ''}>
-                            ${code === 'custom' ? 'CUSTOM' : code.toUpperCase()}
-                        </button>
+                <div class="bftd-fws-note" style="margin-bottom:6px">SCAN DATE / TIME RANGE</div>
+                <div class="bftd-fws-periods" style="margin-bottom:9px">
+                    ${[['1M',1],['3M',3],['6M',6],['12M',12]].map(([label,months]) => `
+                        <button class="bftd-fws-period" data-quick-months="${months}" ${state.scanRunning ? 'disabled' : ''}>${label}</button>
                     `).join('')}
                 </div>
-                ${state.selectedPreset === 'custom' ? `
-                    <div class="bftd-fws-custom-dates">
-                        <label class="bftd-fws-date-card">
-                            <span class="bftd-fws-date-label"><span>START DATE / TIME</span><span>📅</span></span>
-                            <span class="bftd-fws-date-input-row">
-                                <input id="bftd-fws-custom-start" class="bftd-fws-input" type="datetime-local" step="60" value="${esc(state.customStart)}" ${state.scanRunning ? 'disabled' : ''}>
-                                <button type="button" class="bftd-fws-picker-btn" data-picker="start" title="Open start calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
-                            </span>
-                        </label>
-                        <label class="bftd-fws-date-card">
-                            <span class="bftd-fws-date-label"><span>END DATE / TIME</span><span>📅</span></span>
-                            <span class="bftd-fws-date-input-row">
-                                <input id="bftd-fws-custom-end" class="bftd-fws-input" type="datetime-local" step="60" value="${esc(state.customEnd)}" ${state.customStart ? `min="${esc(state.customStart)}"` : ''} ${customMaxEnd ? `max="${esc(localDateTimeInputValue(customMaxEnd))}"` : ''} ${state.scanRunning ? 'disabled' : ''}>
-                                <button type="button" class="bftd-fws-picker-btn" data-picker="end" title="Open end calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
-                            </span>
-                        </label>
-                    </div>
-                    <div class="bftd-fws-note" style="margin-top:6px">
-                        Entering a start date/time automatically sets the end to exactly <b>12 months later</b>. You can then change the end to any later date/time up to exactly <b>60 months / 5 years</b> after the start.
-                    </div>
-                    ${!customValidation.valid && (state.customStart || state.customEnd) ? `<div class="bftd-fws-error" style="margin-top:8px">${esc(customValidation.message)}</div>` : ''}
-                ` : ''}
+                <div class="bftd-fws-note" style="margin:-2px 0 8px">
+                    Quick buttons only fill the date/time selectors below. They set <b>End</b> to the current local date/time and <b>Start</b> to exactly 1, 3, 6 or 12 calendar months earlier. You can edit either field before scanning.
+                </div>
+                <div class="bftd-fws-custom-dates">
+                    <label class="bftd-fws-date-card">
+                        <span class="bftd-fws-date-label"><span>START DATE / TIME</span><span>📅</span></span>
+                        <span class="bftd-fws-date-input-row">
+                            <input id="bftd-fws-custom-start" class="bftd-fws-input" type="datetime-local" step="1" value="${esc(state.customStart)}" ${state.scanRunning ? 'disabled' : ''}>
+                            <button type="button" class="bftd-fws-picker-btn" data-picker="start" title="Open start calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
+                        </span>
+                    </label>
+                    <label class="bftd-fws-date-card">
+                        <span class="bftd-fws-date-label"><span>END DATE / TIME</span><span>📅</span></span>
+                        <span class="bftd-fws-date-input-row">
+                            <input id="bftd-fws-custom-end" class="bftd-fws-input" type="datetime-local" step="1" value="${esc(state.customEnd)}" ${state.customStart ? `min="${esc(state.customStart)}"` : ''} ${customMaxEnd ? `max="${esc(localDateTimeInputValue(customMaxEnd))}"` : ''} ${state.scanRunning ? 'disabled' : ''}>
+                            <button type="button" class="bftd-fws-picker-btn" data-picker="end" title="Open end calendar" ${state.scanRunning ? 'disabled' : ''}>📅</button>
+                        </span>
+                    </label>
+                </div>
+                <div class="bftd-fws-note" style="margin-top:6px">
+                    Manually changing the start date/time automatically sets the end to exactly <b>12 months later</b>. You can then change the end to any later date/time up to exactly <b>60 months / 5 years</b> after the start.
+                </div>
+                ${!customValidation.valid && (state.customStart || state.customEnd) ? `<div class="bftd-fws-error" style="margin-top:8px">${esc(customValidation.message)}</div>` : ''}
                 <div class="bftd-fws-card" style="margin-top:8px;padding:9px 10px">
                     <label class="bftd-fws-row" style="cursor:${state.scanRunning ? 'default' : 'pointer'};align-items:flex-start">
                         <input id="bftd-fws-include-chains" type="checkbox" ${state.includeChains ? 'checked' : ''} ${state.scanRunning ? 'disabled' : ''} style="margin:2px 2px 0 0;transform:scale(1.2);accent-color:var(--bftd-accent)">
@@ -2730,7 +2729,7 @@
                     <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Enabling chains adds completed-chain history calls and extra local sorting. It no longer makes one chain-report API call per chain, but long multi-year ranges with lots of chains can still add significant processing time.</div>
                 </div>
                 <div class="bftd-fws-note" style="margin-top:7px">
-                    The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report.${state.includeChains ? ' It also finds completed chains that started inside the selected period; member participation is then rebuilt locally from the same detailed attack history already used by the scan.' : ' Chain scanning is currently <b>OFF</b>, so no chain-history requests or chain processing will be performed.'} It then scans all outgoing faction attacks in the period so war hits, assists, retals and outside hits are classified against the exact war windows/opponents, followed by completed OCs and faction-armory Xanax actions. Running the same 1M / 3M / 6M / 12M period again replaces that period's previous saved scan. Re-running the exact same Custom start/end range replaces that saved Custom scan.
+                    The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report, then scans all outgoing faction attacks so war hits, assists, retals and outside hits are classified against the exact war windows/opponents.${state.includeChains ? ' After the attack history is complete, it loads completed chains that started inside the selected period and rebuilds member chain participation locally from those same attack records.' : ' Chain scanning is currently <b>OFF</b>, so no chain-history requests or chain processing will be performed.'} It then scans completed OCs and faction-armory Xanax actions. Every scan is saved by its exact Start/End timestamps. Re-running that exact same range replaces its previous saved scan; different ranges remain available in Cached Scans.
                 </div>
                 <div class="bftd-fws-ok" style="margin-top:8px"><b>LOCAL HISTORY CACHE:</b> Attacks, completed OCs, armory logs and completed chains are stored in this browser. Overlapping future scans reuse that history and request only missing date ranges. Shared scan downloads also carry the reusable history so another user can import it locally.</div>
                 <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The first scan of a large uncached period can still take significantly longer. Once that history is cached locally, overlapping scans should need far fewer Torn API calls.</div>
@@ -2739,8 +2738,9 @@
                     <button id="bftd-fws-scan" class="bftd-fws-btn" ${(state.scanRunning || !customValidation.valid) ? 'disabled' : ''}>${esc(scanLabel)}</button>
                 </div>
                 <div class="bftd-fws-row wrap" style="margin-top:8px">
-                    <button id="bftd-fws-download-scan" class="bftd-fws-btn secondary" ${(!ready || state.scanRunning) ? 'disabled' : ''}>DOWNLOAD ${esc(state.selectedPreset.toUpperCase())} SCAN</button>
-                    <button id="bftd-fws-upload-scan" class="bftd-fws-btn secondary" ${state.scanRunning ? 'disabled' : ''}>UPLOAD ${esc(state.selectedPreset.toUpperCase())} SCAN</button>
+                    <button id="bftd-fws-download-scan" class="bftd-fws-btn secondary" ${(!ready || state.scanRunning) ? 'disabled' : ''}>DOWNLOAD SCAN</button>
+                    <button id="bftd-fws-upload-scan" class="bftd-fws-btn secondary" ${state.scanRunning ? 'disabled' : ''}>UPLOAD SCAN</button>
+                    <button id="bftd-fws-cached-scans" class="bftd-fws-btn secondary" ${state.scanRunning ? 'disabled' : ''}>CACHED SCANS</button>
                     <input id="bftd-fws-upload-scan-file" type="file" accept=".json,application/json" hidden>
                 </div>
                 ${state.shareMessage ? `<div class="${state.shareMessageType === 'error' ? 'bftd-fws-error' : 'bftd-fws-ok'}" style="margin-top:8px">${esc(state.shareMessage)}</div>` : ''}
@@ -2764,9 +2764,9 @@
             <div id="bftd-fws-members" class="bftd-fws-members"></div>
         `;
 
-        body.querySelectorAll('[data-period]').forEach(btn => {
+        body.querySelectorAll('[data-quick-months]').forEach(btn => {
             btn.addEventListener('click', () => {
-                state.selectedPreset = btn.dataset.period;
+                applyQuickRange(Number(btn.dataset.quickMonths));
                 state.currentMember = null;
                 document.getElementById('bftd-fws-stats')?.remove();
                 state.statsPanel = null;
@@ -2839,6 +2839,7 @@
                 renderMain();
             }
         });
+        body.querySelector('#bftd-fws-cached-scans')?.addEventListener('click', openCachedScansPanel);
         const uploadInput = body.querySelector('#bftd-fws-upload-scan-file');
         body.querySelector('#bftd-fws-upload-scan')?.addEventListener('click', () => uploadInput?.click());
         uploadInput?.addEventListener('change', async () => {
@@ -2877,6 +2878,69 @@
         renderMemberList();
     }
 
+    function openCachedScansPanel() {
+        const existing = document.getElementById('bftd-fws-cache');
+        if (existing) {
+            state.cachedPanel = existing;
+            renderCachedScansPanel();
+            bringPanelFront(existing);
+            return;
+        }
+        state.cachedPanel = panelShell('bftd-fws-cache', 'Cached Scans', 'Local browser saves');
+        renderCachedScansPanel();
+    }
+
+    function renderCachedScansPanel() {
+        const panel = document.getElementById('bftd-fws-cache');
+        const body = panel?.querySelector('.bftd-fws-body');
+        if (!body) return;
+        const scans = getLocalCachedScans();
+        body.innerHTML = `
+            <div class="bftd-fws-card">
+                <div style="font-weight:800">LOCAL CACHED SCANS</div>
+                <div class="bftd-fws-note" style="margin-top:4px">These scans are stored only in this browser/userscript setup. Loading one fills the main Start/End selectors with that scan's exact timestamps and immediately reopens its saved results without calling Torn.</div>
+            </div>
+            ${scans.length ? scans.map((row, index) => {
+                const range = row.range || {};
+                const generated = row.generatedAt ? new Date(row.generatedAt).toLocaleString() : 'Unknown';
+                const duration = row.scanDurationMs ? formatScanDuration(row.scanDurationMs) : '—';
+                const chains = row.chainSummary || row.chainsIncluded ? 'Included' : 'Not included';
+                return `
+                    <div class="bftd-fws-card">
+                        <div class="bftd-fws-row" style="align-items:flex-start">
+                            <div class="bftd-fws-grow">
+                                <div style="font-weight:800">${esc(dateTime(range.from))}</div>
+                                <div class="bftd-fws-note">to ${esc(dateTime(range.to))}</div>
+                            </div>
+                            <button class="bftd-fws-btn" data-load-cache="${index}">LOAD</button>
+                        </div>
+                        <div class="bftd-fws-note" style="margin-top:7px">
+                            Saved ${esc(generated)} • ${fmt(row.warSummary?.warCount || 0)} war(s) • Chains: ${esc(chains)} • Scan time: ${esc(duration)}${row.importedAt ? ` • Imported ${esc(new Date(row.importedAt).toLocaleString())}` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('') : '<div class="bftd-fws-note">No saved scans are available for this faction on this browser yet.</div>'}
+        `;
+        body.querySelectorAll('[data-load-cache]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const row = scans[Number(btn.dataset.loadCache)];
+                const range = row?.range;
+                if (!range?.from || !range?.to) return;
+                state.customStart = localDateTimeInputValue(range.from * 1000);
+                state.customEnd = localDateTimeInputValue(range.to * 1000);
+                state.selectedPreset = 'custom';
+                state.currentMember = null;
+                document.getElementById('bftd-fws-stats')?.remove();
+                state.statsPanel = null;
+                state.scanError = '';
+                state.shareMessage = `Cached scan loaded • ${dateTime(range.from)} → ${dateTime(range.to)}.`;
+                state.shareMessageType = 'ok';
+                renderMain();
+                if (state.mainPanel?.isConnected) bringPanelFront(state.mainPanel);
+            });
+        });
+    }
+
     function setScanProgress(message, detail = '') {
         state.scanProgress = { message, detail };
         if (state.mainPanel && document.getElementById('bftd-fws-main')) renderMain();
@@ -2885,8 +2949,8 @@
     async function runFactionScan(forceRefresh = true) {
         if (state.scanRunning) return;
         const range = getPresetRange();
-        if (range.code === 'custom' && !range.valid) {
-            state.scanError = range.validationMessage || 'Choose a valid custom time period first.';
+        if (!range.valid) {
+            state.scanError = range.validationMessage || 'Choose a valid start and end date/time first.';
             renderMain();
             return;
         }
@@ -2924,7 +2988,7 @@
                 chainScan = await scanFactionChainHistory(range, (pages, chainsFound, totalRanges, currentRange) => {
                     setScanProgress(`${stage}/${totalStages} — Loading & sorting completed chains…`, `${pages} new chain-history API page(s) • ${chainsFound} chain row(s) fetched • missing range ${currentRange || 0}/${totalRanges || 0} • 0 chain-report calls`);
                 });
-                chainSummary = buildAccurateLocalChainSummary(chainScan, attackScan.attacks, range);
+                chainSummary = buildAccurateLocalChainSummary(chainScan, attackScan.attacks, range, warScan.wars);
                 stage += 1;
             }
 
@@ -2982,6 +3046,7 @@
                     chains: includeChains ? { apiPages: chainScan.historyPages, apiFetched: chainScan.apiChainsSeen, reused: Math.max(0, (chainScan.cacheCount || 0) - (chainScan.apiChainsSeen || 0)), missingRanges: chainScan.missingRangesFetched || 0 } : null
                 }
             );
+            if (document.getElementById('bftd-fws-cache')) renderCachedScansPanel();
 
             const completedIn = formatScanDuration(Date.now() - scanStartedAt);
             const historyPagesFetched = num(attackScan.pageCount) + num(ocScan.pageCount) + num(armoryScan.pageCount) + (includeChains ? num(chainScan.historyPages) : 0);
@@ -3081,10 +3146,7 @@
 
     function cacheKey(range) {
         const factionId = state.faction?.id || 0;
-        if (String(range?.code || '').toLowerCase() === 'custom') {
-            return `${factionId}:custom:${Math.floor(num(range?.from))}:${Math.floor(num(range?.to))}`;
-        }
-        return `${factionId}:${range.code}`;
+        return `${factionId}:range:${Math.floor(num(range?.from))}:${Math.floor(num(range?.to))}`;
     }
 
     function loadCacheStore() {
@@ -3100,35 +3162,54 @@
     function saveCacheStore(store) {
         const entries = Object.entries(store)
             .sort((a, b) => num(b[1]?.generatedAt) - num(a[1]?.generatedAt))
-            .slice(0, 20);
+            .slice(0, 30);
         GM_setValue(APP.cacheStorage, JSON.stringify(Object.fromEntries(entries)));
+    }
+
+    function cacheEntryMatchesRange(row, range) {
+        return Math.floor(num(row?.range?.from)) === Math.floor(num(range?.from))
+            && Math.floor(num(row?.range?.to)) === Math.floor(num(range?.to));
     }
 
     function getCached(range) {
         const store = loadCacheStore();
-        const hit = store[cacheKey(range)];
-        if (!hit || !hit.aggregates || !hit.range) return null;
-        return hit;
+        const direct = store[cacheKey(range)];
+        if (direct?.aggregates && direct?.range) return direct;
+        const factionPrefix = `${state.faction?.id || 0}:`;
+        let best = null;
+        for (const [key, row] of Object.entries(store)) {
+            if (!key.startsWith(factionPrefix) || !row?.aggregates || !row?.range) continue;
+            if (!cacheEntryMatchesRange(row, range)) continue;
+            if (!best || num(row.generatedAt) > num(best.generatedAt)) best = row;
+        }
+        return best;
+    }
+
+    function getLocalCachedScans() {
+        const store = loadCacheStore();
+        const factionPrefix = `${state.faction?.id || 0}:`;
+        const byRange = new Map();
+        for (const [key, row] of Object.entries(store)) {
+            if (!key.startsWith(factionPrefix) || !row?.aggregates || !row?.range) continue;
+            const from = Math.floor(num(row.range.from));
+            const to = Math.floor(num(row.range.to));
+            if (!from || !to || to <= from) continue;
+            const id = `${from}:${to}`;
+            const prev = byRange.get(id);
+            if (!prev || num(row.generatedAt) > num(prev.generatedAt)) byRange.set(id, row);
+        }
+        return [...byRange.values()].sort((a,b) => num(b.generatedAt) - num(a.generatedAt));
     }
 
     function savePeriodCacheEntry(range, entry) {
         const store = loadCacheStore();
-        const exactKey = cacheKey(range);
         const factionPrefix = `${state.faction?.id || 0}:`;
-        const periodCode = String(range?.code || '').toLowerCase();
-
-        // Fixed presets keep one canonical slot per faction + period. Custom scans are keyed by
-        // their exact start/end timestamps, so re-running the same custom range replaces it while
-        // other custom ranges remain available.
-        if (periodCode !== 'custom') {
-            for (const [key, row] of Object.entries(store)) {
-                if (key === exactKey) continue;
-                if (key.startsWith(factionPrefix) && String(row?.range?.code || '').toLowerCase() === periodCode) {
-                    delete store[key];
-                }
-            }
+        for (const [key, row] of Object.entries(store)) {
+            if (!key.startsWith(factionPrefix)) continue;
+            if (cacheEntryMatchesRange(row, range)) delete store[key];
         }
-        store[exactKey] = entry;
+        const normalizedRange = { ...(entry?.range || range), code:'custom', label:'Selected time period', from:Math.floor(num(range.from)), to:Math.floor(num(range.to)), valid:true };
+        store[cacheKey(normalizedRange)] = { ...entry, range: normalizedRange };
         saveCacheStore(store);
     }
 
@@ -3156,7 +3237,10 @@
 
     function clearPeriodCache(range) {
         const store = loadCacheStore();
-        delete store[cacheKey(range)];
+        const factionPrefix = `${state.faction?.id || 0}:`;
+        for (const [key, row] of Object.entries(store)) {
+            if (key.startsWith(factionPrefix) && cacheEntryMatchesRange(row, range)) delete store[key];
+        }
         saveCacheStore(store);
     }
 
@@ -3326,9 +3410,10 @@
         return null;
     }
 
-    function createLocalChainCollector(chains) {
+    function createLocalChainCollector(chains, wars = []) {
         return {
             chains: (Array.isArray(chains) ? chains : []).slice().sort((a, b) => num(a?.start) - num(b?.start)),
+            wars: Array.isArray(wars) ? wars : [],
             byMember: Object.create(null)
         };
     }
@@ -3344,6 +3429,8 @@
                 chain: chain.chain,
                 factionRespect: chain.respect,
                 hits: 0,
+                warTargetHits: 0,
+                outsideHits: 0,
                 totalAttacks: 0,
                 respect: 0,
                 assists: 0,
@@ -3386,6 +3473,10 @@
         if (validResult && chainPosition > 0) {
             row.hits += 1;
             row.respect += respectGain;
+            const defenderFaction = defenderFactionId(attack);
+            const targetWar = targetWarForAttack(attackEndTs(attack), defenderFaction, collector.wars || []);
+            if (targetWar) row.warTargetHits += 1;
+            else row.outsideHits += 1;
         }
     }
 
@@ -3414,8 +3505,8 @@
         };
     }
 
-    function buildAccurateLocalChainSummary(chainScan, attacks, range) {
-        const collector = createLocalChainCollector(chainScan?.chains || []);
+    function buildAccurateLocalChainSummary(chainScan, attacks, range, wars = []) {
+        const collector = createLocalChainCollector(chainScan?.chains || [], wars);
         const from = num(range?.from);
         const to = num(range?.to);
         const seen = new Set();
@@ -4354,7 +4445,7 @@
             '--bftd-scroll-thumb','--bftd-launcher-bg','--bftd-launcher-border','--bftd-launcher-text'
         ];
         const rootVars = vars.map(name => `${name}:${computed.getPropertyValue(name).trim()};`).join('');
-        const title = `${member.name} [${member.id}] — Faction Stats — ${String(range.code || '').toUpperCase()}`;
+        const title = `${member.name} [${member.id}] — Faction Stats — ${dateTime(range.from)} to ${dateTime(range.to)}`;
         const generated = new Date(meta.generatedAt || Date.now()).toLocaleString();
         const html = `<!doctype html>
 <html lang="en">
@@ -4381,7 +4472,7 @@ ${clone.outerHTML}
 
         const factionPart = safeDownloadName(state.faction?.name || `Faction_${state.faction?.id || 0}`);
         const memberPart = safeDownloadName(`${member.name}_${member.id}`);
-        const filename = `Faction_Helper_${factionPart}_${memberPart}_${String(range.code || '').toUpperCase()}_Stats.html`;
+        const filename = `Faction_Helper_${factionPart}_${memberPart}_Range_Stats.html`;
         downloadTextFile(filename, html, 'text/html;charset=utf-8');
     }
 
@@ -4418,17 +4509,18 @@ ${clone.outerHTML}
         const chainRows = memberChains
             .slice()
             .sort((a, b) => num(a.start) - num(b.start))
-            .map(c => `
+            .map(c => {
+                const hasSplit = Number.isFinite(Number(c.warTargetHits)) && Number.isFinite(Number(c.outsideHits));
+                return `
                 <tr>
                     <td>#${esc(c.id)}<div class="bftd-fws-note">${esc(dateTime(c.start))} → ${esc(dateTime(c.end))}</div></td>
                     <td>${fmt(c.chain)}</td>
-                    <td>${fmt(c.hits)}</td>
-                    <td>${fmt(c.totalAttacks)}</td>
-                    <td>${fmt(c.assists || 0)}</td>
-                    <td>${fmt(c.losses || 0)}</td>
+                    <td>${hasSplit ? fmt(c.warTargetHits) : '—'}</td>
+                    <td>${hasSplit ? fmt(c.outsideHits) : '—'}</td>
                     <td>${fmt(c.respect, 2)}</td>
                 </tr>
-            `).join('') || `<tr><td colspan="7">${chainSummaryAvailable ? 'No completed-chain participation was found for this member in the selected period.' : 'Chain participation was not included in this saved scan. Run this period again to add chain data.'}</td></tr>`;
+            `;
+            }).join('') || `<tr><td colspan="5">${chainSummaryAvailable ? 'No completed-chain participation was found for this member in the selected period.' : 'Chain participation was not included in this saved scan. Run this period again to add chain data.'}</td></tr>`;
 
         const warRows = Object.values(s.warBreakdown || {})
             .sort((a, b) => num(a.start) - num(b.start))
@@ -4546,12 +4638,12 @@ ${clone.outerHTML}
                     <div class="bftd-fws-stat"><div class="v">${chainSummaryAvailable ? fmt(meta.chainSummary?.chainCount || 0) : '—'}</div><div class="k">FACTION CHAINS IN PERIOD</div></div>
                 </div>
                 <div style="overflow:auto">
-                    <table class="bftd-fws-table" style="min-width:840px">
-                        <thead><tr><th>CHAIN / DATE</th><th>CHAIN SIZE</th><th>MEMBER HITS</th><th>ATTACKS IN WINDOW</th><th>ASSISTS</th><th>LOSSES</th><th>CHAIN-HIT RESPECT</th></tr></thead>
+                    <table class="bftd-fws-table" style="min-width:650px">
+                        <thead><tr><th>CHAIN / DATE</th><th>CHAIN SIZE</th><th>WAR TARGET HITS</th><th>OUTSIDE HITS</th><th>CHAIN-HIT RESPECT</th></tr></thead>
                         <tbody>${chainRows}</tbody>
                     </table>
                 </div>
-                <div class="bftd-fws-note" style="margin-top:8px">Chain participation is rebuilt locally after the detailed attack scan. MEMBER HITS counts only unique outgoing successful attacks that Torn itself marks with a positive chain position inside the matching completed-chain window. Assists, losses, escapes, stalemates, interrupted attacks and ordinary attacks during the window do not count as participation.</div>
+                <div class="bftd-fws-note" style="margin-top:8px">Chain participation is rebuilt locally after the detailed attack scan. WAR TARGET HITS are validated chain hits against the active ranked-war opponent. OUTSIDE HITS are all other validated chain hits. CHAIN-HIT RESPECT is the respect earned from those validated chain hits.</div>
             </div>
 
             <div class="bftd-fws-card">
