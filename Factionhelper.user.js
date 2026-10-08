@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Faction Helper
 // @namespace    https://www.torn.com/
-// @version      1.5.2
-// @description  Faction scanner with preset/custom time ranges, per-member war/chain/outside-hit/OC/Xanax stats, fully themed panels, custom resize handles, and a native Torn faction action button.
+// @version      1.6.0
+// @description  Faction scanner with reusable local history caching, low-API chain analysis, preset/custom time ranges, per-member war/chain/OC/Xanax stats, themed panels, and Torn faction integration.
 // @author       BackFromTheDead Gaming
 // @match        https://www.torn.com/*
 // @connect      api.torn.com
@@ -18,12 +18,11 @@
 
     const APP = {
         name: 'Faction Helper',
-        version: '1.5.2',
+        version: '1.6.0',
         keyStorage: 'bftd_fws_api_key_v1',
         cacheStorage: 'bftd_fws_stats_cache_v5',
         xanaxCacheStorage: 'bftd_fws_xanax_cache_v1',
         warReportCacheStorage: 'bftd_fh_war_report_cache_v1',
-        chainReportCacheStorage: 'bftd_fh_chain_report_cache_v1',
         includeChainsStorage: 'bftd_fh_include_chains_v1',
         uiStorage: 'bftd_fws_ui_v1',
         cacheTtlMs: 365 * 24 * 60 * 60 * 1000,
@@ -34,7 +33,7 @@
         maxTransientRetries: 3,
         apiBase: 'https://api.torn.com/v2',
         customKeyUrl:
-            'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=Faction%20Helper&user=faction,personalstats&faction=basic,members,attacks,crimes,news,rankedwars,rankedwarreport,chains,chainreport'
+            'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=Faction%20Helper&user=faction,personalstats&faction=basic,members,attacks,crimes,news,rankedwars,rankedwarreport,chains'
     };
 
     const state = {
@@ -69,6 +68,209 @@
         factionActionRow: null,
         factionActionTemplate: null
     };
+
+    const HISTORY_DB_NAME = 'BFTD_Faction_Helper_History';
+    const HISTORY_DB_VERSION = 1;
+    let historyDbPromise = null;
+    let historyDbUnavailable = false;
+
+    function idbRequest(request) {
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error('IndexedDB request failed.'));
+        });
+    }
+
+    function idbTransactionDone(tx) {
+        return new Promise((resolve, reject) => {
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed.'));
+            tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction was aborted.'));
+        });
+    }
+
+    function openHistoryDb() {
+        if (historyDbUnavailable) return Promise.resolve(null);
+        if (historyDbPromise) return historyDbPromise;
+        if (typeof indexedDB === 'undefined') {
+            historyDbUnavailable = true;
+            return Promise.resolve(null);
+        }
+        historyDbPromise = new Promise((resolve) => {
+            try {
+                const request = indexedDB.open(HISTORY_DB_NAME, HISTORY_DB_VERSION);
+                request.onupgradeneeded = () => {
+                    const db = request.result;
+                    if (!db.objectStoreNames.contains('records')) {
+                        const store = db.createObjectStore('records', { keyPath: 'key' });
+                        store.createIndex('byFactionTypeTs', ['factionId', 'type', 'ts'], { unique: false });
+                    }
+                    if (!db.objectStoreNames.contains('coverage')) {
+                        db.createObjectStore('coverage', { keyPath: 'key' });
+                    }
+                };
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => {
+                    historyDbUnavailable = true;
+                    resolve(null);
+                };
+                request.onblocked = () => resolve(null);
+            } catch {
+                historyDbUnavailable = true;
+                resolve(null);
+            }
+        });
+        return historyDbPromise;
+    }
+
+    function historyFactionId() {
+        return Number(state.faction?.id || 0);
+    }
+
+    function historyCoverageKey(type) {
+        return `${historyFactionId()}:${type}`;
+    }
+
+    function mergeCoverageIntervals(intervals) {
+        const rows = (Array.isArray(intervals) ? intervals : [])
+            .map(row => [Math.floor(num(row?.[0])), Math.floor(num(row?.[1]))])
+            .filter(([from, to]) => from > 0 && to >= from)
+            .sort((a, b) => a[0] - b[0]);
+        const merged = [];
+        for (const row of rows) {
+            const last = merged[merged.length - 1];
+            if (!last || row[0] > last[1] + 1) merged.push(row.slice());
+            else last[1] = Math.max(last[1], row[1]);
+        }
+        return merged;
+    }
+
+    async function historyGetCoverage(type) {
+        const db = await openHistoryDb();
+        if (!db || !historyFactionId()) return [];
+        try {
+            const tx = db.transaction('coverage', 'readonly');
+            const row = await idbRequest(tx.objectStore('coverage').get(historyCoverageKey(type)));
+            return mergeCoverageIntervals(row?.intervals || []);
+        } catch {
+            return [];
+        }
+    }
+
+    async function historyMarkCoverage(type, from, to) {
+        const db = await openHistoryDb();
+        if (!db || !historyFactionId() || !from || to < from) return;
+        try {
+            const existing = await historyGetCoverage(type);
+            const intervals = mergeCoverageIntervals([...existing, [Math.floor(from), Math.floor(to)]]);
+            const tx = db.transaction('coverage', 'readwrite');
+            tx.objectStore('coverage').put({ key: historyCoverageKey(type), intervals, updatedAt: Date.now() });
+            await idbTransactionDone(tx);
+        } catch {
+            // Local history caching is an optimization; scans still work if IndexedDB is unavailable.
+        }
+    }
+
+    async function historyMissingRanges(type, from, to) {
+        from = Math.floor(num(from));
+        to = Math.floor(num(to));
+        if (!from || !to || to < from) return [];
+        const db = await openHistoryDb();
+        if (!db || !historyFactionId()) return [[from, to]];
+        const coverage = await historyGetCoverage(type);
+        const missing = [];
+        let cursor = from;
+        for (const [a, b] of coverage) {
+            if (b < cursor) continue;
+            if (a > to) break;
+            if (a > cursor) missing.push([cursor, Math.min(to, a - 1)]);
+            cursor = Math.max(cursor, b + 1);
+            if (cursor > to) break;
+        }
+        if (cursor <= to) missing.push([cursor, to]);
+        return missing;
+    }
+
+    async function historyPutRecords(type, rows, idGetter, tsGetter) {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        if (!db || !factionId || !Array.isArray(rows) || !rows.length) return;
+        try {
+            const tx = db.transaction('records', 'readwrite');
+            const store = tx.objectStore('records');
+            for (const data of rows) {
+                const id = String(idGetter(data) ?? '');
+                const ts = Math.floor(num(tsGetter(data)));
+                if (!id || !ts) continue;
+                store.put({
+                    key: `${factionId}:${type}:${id}`,
+                    factionId,
+                    type,
+                    ts,
+                    data
+                });
+            }
+            await idbTransactionDone(tx);
+        } catch {
+            // Ignore local-cache write failures and keep the live scan usable.
+        }
+    }
+
+    async function historyGetRecords(type, from, to) {
+        const db = await openHistoryDb();
+        const factionId = historyFactionId();
+        if (!db || !factionId) return [];
+        try {
+            const tx = db.transaction('records', 'readonly');
+            const index = tx.objectStore('records').index('byFactionTypeTs');
+            const range = IDBKeyRange.bound(
+                [factionId, type, Math.floor(num(from))],
+                [factionId, type, Math.floor(num(to))]
+            );
+            const rows = await idbRequest(index.getAll(range));
+            return (rows || []).map(row => row.data).filter(Boolean);
+        } catch {
+            return [];
+        }
+    }
+
+    async function historyImportBundle(bundle, range) {
+        if (!bundle || typeof bundle !== 'object') return;
+        const from = Math.floor(num(range?.from));
+        const to = Math.floor(num(range?.to));
+        if (!from || !to || to < from) return;
+        const specs = [
+            ['attacks', bundle.attacks, row => row?.id, row => row?.ended],
+            ['crimes', bundle.crimes, row => row?.id, row => row?.executed_at],
+            ['armory', bundle.armory, row => row?.id, row => row?.timestamp],
+            ['chains', bundle.chains, row => row?.id, row => row?.start]
+        ];
+        for (const [type, rows, idGetter, tsGetter] of specs) {
+            if (!Array.isArray(rows)) continue;
+            await historyPutRecords(type, rows, idGetter, tsGetter);
+            if (bundle?.complete?.[type] === true) await historyMarkCoverage(type, from, to);
+        }
+    }
+
+    async function historyExportBundle(range, includeChains) {
+        const complete = {
+            attacks: (await historyMissingRanges('attacks', range.from, range.to)).length === 0,
+            crimes: (await historyMissingRanges('crimes', range.from, range.to)).length === 0,
+            armory: (await historyMissingRanges('armory', range.from, range.to)).length === 0
+        };
+        const bundle = {
+            schemaVersion: 1,
+            complete,
+            attacks: await historyGetRecords('attacks', range.from, range.to),
+            crimes: await historyGetRecords('crimes', range.from, range.to),
+            armory: await historyGetRecords('armory', range.from, range.to)
+        };
+        if (includeChains) {
+            complete.chains = (await historyMissingRanges('chains', range.from, range.to)).length === 0;
+            bundle.chains = await historyGetRecords('chains', range.from, range.to);
+        }
+        return bundle;
+    }
 
     const SUCCESS_RESULTS = new Set(['attacked', 'mugged', 'hospitalized', 'special', 'bounty', 'looted']);
     const FAILURE_RESULTS = new Set(['lost', 'stalemate', 'escape', 'timeout', 'interrupted', 'arrested']);
@@ -2104,7 +2306,7 @@
                 <div style="font-weight:800;margin-bottom:6px">Faction API key required</div>
                 <div class="bftd-fws-note">
                     This script only unlocks when your Torn position has <b>Faction API Access</b>.
-                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>chains</b> and <b>chainreport</b> are only required when the Include Chains option is enabled.
+                    Your key must allow faction <b>basic</b>, <b>members</b>, <b>rankedwars</b>, <b>rankedwarreport</b>, <b>attacks</b>, <b>crimes</b> and <b>news</b>, plus user <b>personalstats</b> for Xanax history. <b>chains</b> is only required when the Include Chains option is enabled. Faction Helper no longer needs <b>chainreport</b> permission because chain participation is rebuilt locally from the attack scan.
                     The key is stored locally in this userscript manager and is sent only to Torn's API.
                 </div>
             </div>
@@ -2145,7 +2347,7 @@
             <div class="bftd-fws-card">
                 <div class="bftd-fws-note">
                     Required: your Torn faction position must have <b>Faction API Access</b>, and the API key must allow
-                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/chains</b> and <b>faction/chainreport</b> are additionally required only when Include Chains is enabled.
+                    <b>faction/basic</b>, <b>faction/members</b>, <b>faction/rankedwars</b>, <b>faction/rankedwarreport</b>, <b>faction/attacks</b>, <b>faction/crimes</b>, <b>faction/news</b> and <b>user/personalstats</b>. <b>faction/chains</b> is additionally required only when Include Chains is enabled; <b>faction/chainreport</b> is no longer required.
                 </div>
                 <div class="bftd-fws-row" style="margin-top:9px">
                     <button id="bftd-fws-retry" class="bftd-fws-btn">RETRY</button>
@@ -2289,7 +2491,7 @@
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
 
-    function exportSelectedScan() {
+    async function exportSelectedScan() {
         const requestedRange = getPresetRange();
         if (requestedRange.code === 'custom' && !requestedRange.valid) {
             throw new Error(requestedRange.validationMessage || 'Choose a valid custom time period first.');
@@ -2312,7 +2514,7 @@
 
         const payload = {
             kind: 'FactionHelperScan',
-            schemaVersion: 1,
+            schemaVersion: 2,
             appVersion: APP.version,
             exportedAt: Date.now(),
             faction: {
@@ -2324,7 +2526,8 @@
                 ...cached,
                 membersSnapshot
             },
-            xanaxSnapshots
+            xanaxSnapshots,
+            historyBundle: await historyExportBundle(range, Boolean(cached.chainsIncluded || cached.chainSummary))
         };
 
         const factionPart = safeDownloadName(state.faction?.name || `Faction_${state.faction?.id || 0}`);
@@ -2333,14 +2536,14 @@
             ? `CUSTOM_${new Date(range.from * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}_to_${new Date(range.to * 1000).toISOString().slice(0,16).replace(/[:T]/g,'-')}`
             : String(range.code).toUpperCase();
         const filename = `Faction_Helper_${factionPart}_${rangePart}_${stamp}.json`;
-        downloadTextFile(filename, JSON.stringify(payload, null, 2));
+        downloadTextFile(filename, JSON.stringify(payload));
         state.shareMessage = `${range.code === 'custom' ? 'Custom' : String(range.code).toUpperCase()} scan downloaded and ready to share.`;
         state.shareMessageType = 'ok';
         renderMain();
     }
 
     function validateImportedScan(payload, expectedCode) {
-        if (!payload || payload.kind !== 'FactionHelperScan' || Number(payload.schemaVersion) !== 1) {
+        if (!payload || payload.kind !== 'FactionHelperScan' || ![1,2].includes(Number(payload.schemaVersion))) {
             throw new Error('This is not a valid Faction Helper scan-share file.');
         }
         const factionId = Number(payload?.faction?.id || 0);
@@ -2415,12 +2618,16 @@
             armoryPageCount: num(scan.armoryPageCount),
             armoryNewsCount: num(scan.armoryNewsCount),
             scanDurationMs: Math.max(0, num(scan.scanDurationMs)),
+            historyCacheStats: scan.historyCacheStats && typeof scan.historyCacheStats === 'object' ? scan.historyCacheStats : null,
             membersSnapshot: membersSnapshot.length ? cloneMembersSnapshot(membersSnapshot) : cloneMembersSnapshot(state.members),
             importedAt: Date.now(),
             importedFromVersion: String(payload.appVersion || 'unknown'),
             importedFileName: String(file.name || '')
         };
         savePeriodCacheEntry(range, importedEntry);
+        if (payload.historyBundle && typeof payload.historyBundle === 'object') {
+            await historyImportBundle(payload.historyBundle, range);
+        }
 
         if (payload.xanaxSnapshots && typeof payload.xanaxSnapshots === 'object') {
             const xanaxStore = loadXanaxCacheStore();
@@ -2517,15 +2724,16 @@
                         <input id="bftd-fws-include-chains" type="checkbox" ${state.includeChains ? 'checked' : ''} ${state.scanRunning ? 'disabled' : ''} style="margin:2px 2px 0 0;transform:scale(1.2);accent-color:var(--bftd-accent)">
                         <span class="bftd-fws-grow">
                             <b>INCLUDE CHAINS IN THIS SCAN</b><br>
-                            <span class="bftd-fws-note">${state.includeChains ? 'ON — completed-chain history and chain reports will be scanned.' : 'OFF — all chain history/report API calls will be skipped.'}</span>
+                            <span class="bftd-fws-note">${state.includeChains ? 'ON — completed-chain history will be loaded, then participation will be rebuilt locally from the attack scan.' : 'OFF — all chain-history API calls and chain processing will be skipped.'}</span>
                         </span>
                     </label>
-                    <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Enabling chains can add many extra API calls, especially over long periods with lots of completed chains. Leave this unticked when chain participation is not needed.</div>
+                    <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ CHAIN SCANNING CAN ADD A LOT OF TIME:</b> Enabling chains adds completed-chain history calls and extra local sorting. It no longer makes one chain-report API call per chain, but long multi-year ranges with lots of chains can still add significant processing time.</div>
                 </div>
                 <div class="bftd-fws-note" style="margin-top:7px">
-                    The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report.${state.includeChains ? ' It also finds completed chains that started inside the selected period and loads their reports.' : ' Chain scanning is currently <b>OFF</b>, so no chain history or chain-report requests will be made.'} It then scans all outgoing faction attacks in the period so war hits, assists, retals and outside hits are classified against the exact war windows/opponents, followed by completed OCs and faction-armory Xanax actions. Running the same 1M / 3M / 6M / 12M period again replaces that period's previous saved scan. Re-running the exact same Custom start/end range replaces that saved Custom scan.
+                    The scan first finds every ranked war that <b>started inside the selected period</b> and loads its report.${state.includeChains ? ' It also finds completed chains that started inside the selected period; member participation is then rebuilt locally from the same detailed attack history already used by the scan.' : ' Chain scanning is currently <b>OFF</b>, so no chain-history requests or chain processing will be performed.'} It then scans all outgoing faction attacks in the period so war hits, assists, retals and outside hits are classified against the exact war windows/opponents, followed by completed OCs and faction-armory Xanax actions. Running the same 1M / 3M / 6M / 12M period again replaces that period's previous saved scan. Re-running the exact same Custom start/end range replaces that saved Custom scan.
                 </div>
-                <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The larger the selected time period is, the longer the scan may take to complete. Multi-year scans can take significantly longer because Faction Helper must load and process much more Torn history.</div>
+                <div class="bftd-fws-ok" style="margin-top:8px"><b>LOCAL HISTORY CACHE:</b> Attacks, completed OCs, armory logs and completed chains are stored in this browser. Overlapping future scans reuse that history and request only missing date ranges. Shared scan downloads also carry the reusable history so another user can import it locally.</div>
+                <div class="bftd-fws-warning" style="margin-top:8px"><b>⚠ LONGER SCANS TAKE LONGER:</b> The first scan of a large uncached period can still take significantly longer. Once that history is cached locally, overlapping scans should need far fewer Torn API calls.</div>
                 <div class="bftd-fws-scanstatus">
                     <div class="bftd-fws-grow bftd-fws-note"><b>${esc(scanStatus)}</b>${scannedRange ? `<br>${esc(dateTime(scannedRange.from))} → ${esc(dateTime(scannedRange.to))}` : ''}</div>
                     <button id="bftd-fws-scan" class="bftd-fws-btn" ${(state.scanRunning || !customValidation.valid) ? 'disabled' : ''}>${esc(scanLabel)}</button>
@@ -2619,9 +2827,12 @@
 
         body.querySelector('#bftd-fws-scan')?.addEventListener('click', () => runFactionScan(true));
         body.querySelector('#bftd-fws-cancel-main-scan')?.addEventListener('click', () => { state.abortScan = true; });
-        body.querySelector('#bftd-fws-download-scan')?.addEventListener('click', () => {
+        body.querySelector('#bftd-fws-download-scan')?.addEventListener('click', async () => {
             try {
-                exportSelectedScan();
+                state.shareMessage = 'Preparing scan + reusable local history…';
+                state.shareMessageType = 'ok';
+                renderMain();
+                await exportSelectedScan();
             } catch (err) {
                 state.shareMessage = err.message || String(err);
                 state.shareMessageType = 'error';
@@ -2696,38 +2907,40 @@
                 setScanProgress(`1/${totalStages} — Loading ranked-war history & reports…`, `${done}/${total} war reports processed • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
             });
 
-            let chainScan = { summary: null };
             let stage = 2;
+            if (state.abortScan) throw new Error('Scan cancelled.');
+            setScanProgress(`${stage}/${totalStages} — Scanning all faction attacks…`, 'Loading the detailed outgoing attack history first so war and optional chain calculations use the exact same attack records.');
+            const attackStage = stage;
+            const attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks, missingRanges, currentRange, cacheReuse) => {
+                setScanProgress(`${attackStage}/${totalStages} — Scanning all faction attacks…`, `${pages} new API page(s) • ${attacks} attack record(s) • ${cacheReuse || 0} reused from local history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
+            });
+            stage += 1;
+
+            let chainScan = { chains: [], historyPages: 0 };
+            let chainSummary = null;
             if (includeChains) {
                 if (state.abortScan) throw new Error('Scan cancelled.');
-                setScanProgress(`${stage}/${totalStages} — Loading chain history & reports…`, 'Finding completed chains that started inside the selected period and loading member participation.');
-                chainScan = await scanFactionChainsAndReports(range, (done, total, apiCalls, cacheHits, pages) => {
-                    setScanProgress(`${stage}/${totalStages} — Loading chain history & reports…`, `${done}/${total} chain reports processed • ${pages} history page(s) • ${apiCalls} API report call(s) • ${cacheHits} cached report(s)`);
+                setScanProgress(`${stage}/${totalStages} — Loading & sorting completed chains…`, 'Attack history is complete. Loading completed-chain windows, then validating each chain hit locally — 0 per-chain report calls.');
+                chainScan = await scanFactionChainHistory(range, (pages, chainsFound, totalRanges, currentRange) => {
+                    setScanProgress(`${stage}/${totalStages} — Loading & sorting completed chains…`, `${pages} new chain-history API page(s) • ${chainsFound} chain row(s) fetched • missing range ${currentRange || 0}/${totalRanges || 0} • 0 chain-report calls`);
                 });
+                chainSummary = buildAccurateLocalChainSummary(chainScan, attackScan.attacks, range);
                 stage += 1;
             }
 
             if (state.abortScan) throw new Error('Scan cancelled.');
-            setScanProgress(`${stage}/${totalStages} — Scanning all faction attacks…`, `Classifying war hits, assists, retals and outside attacks across ${warScan.wars.length} ranked-war window(s).`);
-            const attackStage = stage;
-            const attackScan = await scanFactionAttacks(range, warScan.wars, warScan.reportStats, (pages, attacks) => {
-                setScanProgress(`${attackStage}/${totalStages} — Scanning all faction attacks…`, `${pages} attack page(s) • ${attacks} outgoing attacks checked`);
-            });
-            stage += 1;
-
-            if (state.abortScan) throw new Error('Scan cancelled.');
             setScanProgress(`${stage}/${totalStages} — Scanning completed organized crimes…`, 'Counting completed OCs by executed_at and participant slot.');
             const ocStage = stage;
-            const ocScan = await scanFactionCrimes(range, (pages, crimes) => {
-                setScanProgress(`${ocStage}/${totalStages} — Scanning completed organized crimes…`, `${pages} OC page(s) • ${crimes} completed OC(s) checked`);
+            const ocScan = await scanFactionCrimes(range, (pages, crimes, cacheReuse, missingRanges, currentRange) => {
+                setScanProgress(`${ocStage}/${totalStages} — Scanning completed organized crimes…`, `${pages} new OC API page(s) • ${crimes} completed OC record(s) • ${cacheReuse || 0} reused from local history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
             });
             stage += 1;
 
             if (state.abortScan) throw new Error('Scan cancelled.');
             setScanProgress(`${stage}/${totalStages} — Scanning faction armory Xanax…`, 'Counting Xanax armory actions by member.');
             const armoryStage = stage;
-            const armoryScan = await scanFactionArmoryXanax(range, (pages, newsCount) => {
-                setScanProgress(`${armoryStage}/${totalStages} — Scanning faction armory Xanax…`, `${pages} armory-news page(s) • ${newsCount} record(s) checked`);
+            const armoryScan = await scanFactionArmoryXanax(range, (pages, newsCount, cacheReuse, missingRanges, currentRange) => {
+                setScanProgress(`${armoryStage}/${totalStages} — Scanning faction armory Xanax…`, `${pages} new armory API page(s) • ${newsCount} record(s) • ${cacheReuse || 0} reused from local history • missing ranges ${currentRange || 0}/${missingRanges || 0}`);
             });
 
             const warSummary = {
@@ -2753,7 +2966,7 @@
                 ocScan.aggregates,
                 armoryScan.aggregates,
                 warSummary,
-                chainScan.summary,
+                chainSummary,
                 attackScan.pageCount,
                 attackScan.fetchedCount,
                 ocScan.pageCount,
@@ -2761,11 +2974,19 @@
                 armoryScan.pageCount,
                 armoryScan.newsCount,
                 Date.now() - scanStartedAt,
-                includeChains
+                includeChains,
+                {
+                    attacks: { apiPages: attackScan.pageCount, apiFetched: attackScan.apiFetchedCount, reused: attackScan.cacheReuseCount, missingRanges: attackScan.missingRangeCount },
+                    crimes: { apiPages: ocScan.pageCount, apiFetched: ocScan.apiFetchedCount, reused: ocScan.cacheReuseCount, missingRanges: ocScan.missingRangeCount },
+                    armory: { apiPages: armoryScan.pageCount, apiFetched: armoryScan.apiFetchedCount, reused: armoryScan.cacheReuseCount, missingRanges: armoryScan.missingRangeCount },
+                    chains: includeChains ? { apiPages: chainScan.historyPages, apiFetched: chainScan.apiChainsSeen, reused: Math.max(0, (chainScan.cacheCount || 0) - (chainScan.apiChainsSeen || 0)), missingRanges: chainScan.missingRangesFetched || 0 } : null
+                }
             );
 
             const completedIn = formatScanDuration(Date.now() - scanStartedAt);
-            state.shareMessage = `Scan completed in ${completedIn}${includeChains ? ' with chains included' : ' without chains'}.`;
+            const historyPagesFetched = num(attackScan.pageCount) + num(ocScan.pageCount) + num(armoryScan.pageCount) + (includeChains ? num(chainScan.historyPages) : 0);
+            const historyRecordsReused = num(attackScan.cacheReuseCount) + num(ocScan.cacheReuseCount) + num(armoryScan.cacheReuseCount);
+            state.shareMessage = `Scan completed in ${completedIn}${includeChains ? ' with chains included' : ' without chains'} • ${historyPagesFetched} new history API page(s) • ${historyRecordsReused} cached record(s) reused.`;
             state.shareMessageType = '';
             state.lastAggregates = attackScan.aggregates;
             state.lastOcAggregates = ocScan.aggregates;
@@ -2853,6 +3074,7 @@
             armoryNewsCount: cached.armoryNewsCount,
             warSummary: cached.warSummary,
             chainSummary: cached.chainSummary || null,
+            historyCacheStats: cached.historyCacheStats || null,
             memberSnapshot: Array.isArray(cached.membersSnapshot) && cached.membersSnapshot.length > 0
         });
     }
@@ -2910,7 +3132,7 @@
         saveCacheStore(store);
     }
 
-    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0, chainsIncluded = false) {
+    function putCached(range, aggregates, ocAggregates, armoryXanaxAggregates, warSummary, chainSummary, pageCount, fetchedCount, ocPageCount, ocCount, armoryPageCount, armoryNewsCount, scanDurationMs = 0, chainsIncluded = false, historyCacheStats = null) {
         savePeriodCacheEntry(range, {
             generatedAt: Date.now(),
             range,
@@ -2927,6 +3149,7 @@
             armoryPageCount,
             armoryNewsCount,
             scanDurationMs: Math.max(0, num(scanDurationMs)),
+            historyCacheStats: historyCacheStats && typeof historyCacheStats === 'object' ? historyCacheStats : null,
             membersSnapshot: cloneMembersSnapshot(state.members)
         });
     }
@@ -2954,29 +3177,8 @@
     function putCachedWarReport(warId, report) {
         const store = loadWarReportCache();
         store[String(warId)] = report;
-        const compact = Object.fromEntries(Object.entries(store).slice(-250));
+        const compact = Object.fromEntries(Object.entries(store).slice(-1000));
         GM_setValue(APP.warReportCacheStorage, JSON.stringify(compact));
-    }
-
-    function loadChainReportCache() {
-        try {
-            const raw = GM_getValue(APP.chainReportCacheStorage, '{}');
-            const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
-            return obj && typeof obj === 'object' ? obj : {};
-        } catch {
-            return {};
-        }
-    }
-
-    function getCachedChainReport(chainId) {
-        return loadChainReportCache()[String(chainId)] || null;
-    }
-
-    function putCachedChainReport(chainId, report) {
-        const store = loadChainReportCache();
-        store[String(chainId)] = report;
-        const compact = Object.fromEntries(Object.entries(store).slice(-500));
-        GM_setValue(APP.chainReportCacheStorage, JSON.stringify(compact));
     }
 
     function extractChains(payload) {
@@ -2995,114 +3197,237 @@
         };
     }
 
-    function extractChainReport(payload) {
-        return payload?.chainreport || payload?.chain_report || payload?.report || null;
-    }
+    async function scanFactionChainHistory(range, onProgress) {
+        const now = Math.floor(Date.now() / 1000);
+        // /faction/chains can temporarily omit a just-finished chain while it is still cooling down.
+        // Keep the most recent 15 minutes refreshable instead of permanently marking that tail as complete.
+        const stableTo = Math.min(range.to, now - 15 * 60);
+        const fetchRanges = stableTo >= range.from
+            ? await historyMissingRanges('chains', range.from, stableTo)
+            : [];
+        if (range.to > stableTo) fetchRanges.push([Math.max(range.from, stableTo + 1), range.to]);
 
-    function chainAttackerHits(attacker) {
-        const attacks = attacker?.attacks || {};
-        const hasBreakdown = ['leave','mug','hospitalize'].some(key => attacks[key] !== undefined && attacks[key] !== null);
-        const successful = num(attacks?.leave) + num(attacks?.mug) + num(attacks?.hospitalize);
-        return hasBreakdown ? successful : num(attacks?.total, 0);
-    }
-
-    async function scanFactionChainsAndReports(range, onProgress) {
-        const selected = [];
-        const seen = new Set();
-        let cursorTo = range.to;
         let historyPages = 0;
-
-        while (cursorTo >= range.from) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
-            const payload = await gmJson(apiUrl('/faction/chains', {
+        let apiChainsSeen = 0;
+        const fetchedChains = [];
+        for (let r = 0; r < fetchRanges.length; r++) {
+            const [gapFrom, gapTo] = fetchRanges[r];
+            let cursorTo = gapTo;
+            let nextUrl = apiUrl('/faction/chains', {
                 limit: 100,
                 sort: 'DESC',
-                from: range.from,
-                to: cursorTo
-            }));
-            historyPages += 1;
-            const rows = extractChains(payload);
-            if (!rows.length) break;
-
-            let oldestStart = 0;
-            for (const raw of rows) {
-                const chain = normalizeChain(raw);
-                if (!chain.id || !chain.start) continue;
-                if (!oldestStart || chain.start < oldestStart) oldestStart = chain.start;
-                if (chain.start >= range.from && chain.start <= range.to && !seen.has(chain.id)) {
-                    seen.add(chain.id);
-                    selected.push(chain);
+                from: gapFrom,
+                to: gapTo
+            });
+            let gapComplete = true;
+            const seenPageUrls = new Set();
+            while (nextUrl && cursorTo >= gapFrom) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                if (seenPageUrls.has(nextUrl)) {
+                    gapComplete = false;
+                    break;
                 }
-            }
+                seenPageUrls.add(nextUrl);
+                const payload = await gmJson(nextUrl);
+                historyPages += 1;
+                const rows = extractChains(payload).map(normalizeChain).filter(row => row.id && row.start);
+                apiChainsSeen += rows.length;
+                fetchedChains.push(...rows);
+                await historyPutRecords('chains', rows, row => row.id, row => row.start);
 
-            if (rows.length < 100 || !oldestStart || oldestStart <= range.from) break;
-            const nextTo = oldestStart - 1;
-            if (nextTo >= cursorTo) break;
-            cursorTo = nextTo;
-            if (historyPages > 1000) throw new Error('Chain history exceeded the safety limit (1,000 pages).');
-        }
-
-        selected.sort((a, b) => a.start - b.start);
-        const memberParticipation = {};
-        let reportApiCalls = 0;
-        let reportCacheHits = 0;
-        let done = 0;
-
-        for (const chain of selected) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
-            let report = getCachedChainReport(chain.id);
-            if (report) {
-                reportCacheHits += 1;
-            } else {
-                const payload = await gmJson(apiUrl(`/faction/${encodeURIComponent(chain.id)}/chainreport`));
-                report = extractChainReport(payload);
-                reportApiCalls += 1;
-                if (report) putCachedChainReport(chain.id, report);
+                let oldestStart = 0;
+                for (const chain of rows) {
+                    if (!oldestStart || chain.start < oldestStart) oldestStart = chain.start;
                 }
+                onProgress?.(historyPages, apiChainsSeen, fetchRanges.length, r + 1);
+                if (!rows.length) break;
 
-            if (report) {
-                const attackers = Array.isArray(report?.attackers) ? report.attackers : Object.values(report?.attackers || {});
-                const reportChainSize = num(report?.details?.chain, chain.chain);
-                for (const attacker of attackers) {
-                    const uid = num(attacker?.id, 0);
-                    if (!uid) continue;
-                    const attacks = attacker?.attacks || {};
-                    const totalAttacks = num(attacks?.total, 0);
-                    const hits = chainAttackerHits(attacker);
-                    if (!memberParticipation[uid]) memberParticipation[uid] = [];
-                    memberParticipation[uid].push({
-                        id: chain.id,
-                        start: num(report?.start, chain.start),
-                        end: num(report?.end, chain.end),
-                        chain: reportChainSize,
-                        factionRespect: num(report?.details?.respect, chain.respect),
-                        hits,
-                        totalAttacks,
-                        respect: num(attacker?.respect?.total, 0),
-                        assists: num(attacks?.assists, 0),
-                        losses: num(attacks?.losses, 0)
+                const apiNext = cleanNextUrl(payload?._metadata?.links?.next);
+                if (apiNext) {
+                    nextUrl = apiNext;
+                } else if (rows.length >= 100 && oldestStart && oldestStart > gapFrom) {
+                    const nextTo = oldestStart - 1;
+                    if (nextTo >= cursorTo) {
+                        gapComplete = false;
+                        break;
+                    }
+                    cursorTo = nextTo;
+                    nextUrl = apiUrl('/faction/chains', {
+                        limit: 100,
+                        sort: 'DESC',
+                        from: gapFrom,
+                        to: cursorTo
                     });
+                } else {
+                    nextUrl = null;
                 }
+                if (historyPages > 1000) throw new Error('Chain history exceeded the safety limit (1,000 pages).');
             }
-
-            done += 1;
-            onProgress?.(done, selected.length, reportApiCalls, reportCacheHits, historyPages);
+            // Do not freeze the recent cooldown tail into coverage; it is intentionally refreshed later.
+            if (gapComplete && gapTo <= stableTo) await historyMarkCoverage('chains', gapFrom, gapTo);
         }
 
-        for (const rows of Object.values(memberParticipation)) {
-            rows.sort((a, b) => num(a.start) - num(b.start));
+        const cachedChains = await historyGetRecords('chains', range.from, range.to);
+        const selected = [...cachedChains, ...fetchedChains]
+            .map(normalizeChain)
+            .filter(chain => chain.id && chain.start >= range.from && chain.start <= range.to)
+            .sort((a, b) => a.start - b.start);
+        const deduped = [];
+        const seen = new Set();
+        for (const chain of selected) {
+            if (seen.has(chain.id)) continue;
+            seen.add(chain.id);
+            deduped.push(chain);
         }
-
         return {
-            summary: {
-                chainCount: selected.length,
-                historyPages,
-                reportApiCalls,
-                reportCacheHits,
-                chains: selected,
-                memberParticipation
-            }
+            chains: deduped,
+            historyPages,
+            apiChainsSeen,
+            cacheCount: deduped.length,
+            missingRangesFetched: fetchRanges.length
         };
+    }
+
+    function attackChainPosition(attack) {
+        return num(attack?.chain ?? attack?.chain_count ?? attack?.chain_position, 0);
+    }
+
+    function findChainForAttack(attack, chains) {
+        const ts = attackEndTs(attack);
+        if (!ts || !Array.isArray(chains) || !chains.length) return null;
+        const position = attackChainPosition(attack);
+        let lo = 0;
+        let hi = chains.length - 1;
+        let candidate = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (num(chains[mid]?.start) <= ts) {
+                candidate = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if (candidate < 0) return null;
+
+        // A completed faction can only have one active chain at a time. Search the nearest
+        // candidate first and allow only a two-second end tolerance for Torn's documented
+        // one-second /chains vs /attacks final-hit timestamp discrepancy.
+        for (let i = candidate; i >= Math.max(0, candidate - 1); i--) {
+            const chain = chains[i];
+            const start = num(chain?.start);
+            const end = num(chain?.end);
+            const finalSize = num(chain?.chain);
+            if (!start || ts < start) continue;
+            if (end && ts > end + 2) continue;
+            if (position > 0 && finalSize > 0 && position > finalSize) continue;
+            return chain;
+        }
+        return null;
+    }
+
+    function createLocalChainCollector(chains) {
+        return {
+            chains: (Array.isArray(chains) ? chains : []).slice().sort((a, b) => num(a?.start) - num(b?.start)),
+            byMember: Object.create(null)
+        };
+    }
+
+    function ensureLocalChainRow(collector, memberId, chain) {
+        if (!collector.byMember[memberId]) collector.byMember[memberId] = Object.create(null);
+        const memberRows = collector.byMember[memberId];
+        if (!memberRows[chain.id]) {
+            memberRows[chain.id] = {
+                id: chain.id,
+                start: chain.start,
+                end: chain.end,
+                chain: chain.chain,
+                factionRespect: chain.respect,
+                hits: 0,
+                totalAttacks: 0,
+                respect: 0,
+                assists: 0,
+                losses: 0,
+                _seenAttackIds: new Set()
+            };
+        }
+        return memberRows[chain.id];
+    }
+
+    function addAttackToLocalChainCollector(collector, attack) {
+        if (!collector?.chains?.length) return;
+        const uid = attackerId(attack);
+        if (!uid) return;
+
+        const chain = findChainForAttack(attack, collector.chains);
+        if (!chain) return;
+        const row = ensureLocalChainRow(collector, uid, chain);
+
+        const attackIdValue = String(attackId(attack, '') || '');
+        if (attackIdValue && row._seenAttackIds.has(attackIdValue)) return;
+        if (attackIdValue) row._seenAttackIds.add(attackIdValue);
+        row.totalAttacks += 1;
+
+        const result = attackResult(attack).toLowerCase();
+        const interrupted = attack?.is_interrupted === true || result === 'interrupted';
+        const assist = result === 'assist';
+        const respectGain = num(attack?.respect_gain ?? attack?.respect, 0);
+        const chainPosition = attackChainPosition(attack);
+        const validResult = !assist && !interrupted && !FAILURE_RESULTS.has(result)
+            && (SUCCESS_RESULTS.has(result) || respectGain > 0);
+
+        if (assist) row.assists += 1;
+        if (result === 'lost') row.losses += 1;
+
+        // MEMBER HITS is deliberately strict: the outgoing faction attack must be a valid
+        // successful result AND Torn itself must assign a positive chain position. This
+        // prevents assists, losses, escapes, stalemates and ordinary attacks during the
+        // chain window from being counted as chain participation.
+        if (validResult && chainPosition > 0) {
+            row.hits += 1;
+            row.respect += respectGain;
+        }
+    }
+
+    function finalizeLocalChainSummary(chainScan, collector) {
+        const memberParticipation = {};
+        for (const [uid, rowsByChain] of Object.entries(collector?.byMember || {})) {
+            const rows = Object.values(rowsByChain)
+                // Participation means the member actually contributed >= 1 Torn-marked chain hit.
+                .filter(row => num(row.hits) > 0)
+                .map(row => {
+                    const { _seenAttackIds, ...clean } = row;
+                    return clean;
+                })
+                .sort((a, b) => num(a.start) - num(b.start));
+            if (rows.length) memberParticipation[uid] = rows;
+        }
+        return {
+            chainCount: chainScan?.chains?.length || 0,
+            historyPages: chainScan?.historyPages || 0,
+            reportApiCalls: 0,
+            reportCacheHits: 0,
+            derivedFromAttacks: true,
+            validation: 'strict-outgoing-success-positive-chain-position',
+            chains: chainScan?.chains || [],
+            memberParticipation
+        };
+    }
+
+    function buildAccurateLocalChainSummary(chainScan, attacks, range) {
+        const collector = createLocalChainCollector(chainScan?.chains || []);
+        const from = num(range?.from);
+        const to = num(range?.to);
+        const seen = new Set();
+        for (const attack of (Array.isArray(attacks) ? attacks : [])) {
+            const ts = attackEndTs(attack);
+            if (!ts || (from && ts < from) || (to && ts > to)) continue;
+            const id = String(attackId(attack, '') || '');
+            if (id && seen.has(id)) continue;
+            if (id) seen.add(id);
+            addAttackToLocalChainCollector(collector, attack);
+        }
+        return finalizeLocalChainSummary(chainScan, collector);
     }
 
     function extractRankedWars(payload) {
@@ -3442,46 +3767,119 @@
         return [];
     }
 
+    function compactAttackForHistory(attack, fallback) {
+        const id = attackId(attack, fallback);
+        return {
+            id,
+            ended: attackEndTs(attack),
+            result: attackResult(attack),
+            respect_gain: num(attack?.respect_gain ?? attack?.respect, 0),
+            respect_loss: num(attack?.respect_loss, 0),
+            is_interrupted: attack?.is_interrupted === true,
+            chain: num(attack?.chain ?? attack?.chain_count ?? attack?.chain_position, 0),
+            attacker: { id: attackerId(attack) },
+            defender: {
+                id: defenderId(attack),
+                faction: { id: defenderFactionId(attack) }
+            },
+            modifiers: attack?.modifiers && typeof attack.modifiers === 'object'
+                ? { ...attack.modifiers }
+                : {}
+        };
+    }
+
     async function scanFactionAttacks(range, wars, reportStats, onProgress) {
         const aggregates = {};
         applyReportStats(aggregates, wars, reportStats);
-        const seen = new Set();
         let pageCount = 0;
-        let fetchedCount = 0;
-        let cursorTo = range.to;
+        const fetchedRows = [];
+        const missingRanges = await historyMissingRanges('attacks', range.from, range.to);
 
-        while (cursorTo >= range.from) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
-
-            const payload = await gmJson(apiUrl('/faction/attacks', {
+        for (let r = 0; r < missingRanges.length; r++) {
+            const [gapFrom, gapTo] = missingRanges[r];
+            let cursorTo = gapTo;
+            let nextUrl = apiUrl('/faction/attacks', {
                 filters: 'outgoing',
                 limit: 100,
                 sort: 'DESC',
-                from: range.from,
-                to: cursorTo
-            }));
-            pageCount += 1;
+                from: gapFrom,
+                to: gapTo
+            });
+            let gapComplete = true;
+            const gapSeen = new Set();
+            const seenPageUrls = new Set();
 
-            const attacks = extractAttacks(payload);
-            let oldestTs = 0;
-            for (let i = 0; i < attacks.length; i++) {
-                const attack = attacks[i];
-                const ts = attackEndTs(attack);
-                if (ts && (!oldestTs || ts < oldestTs)) oldestTs = ts;
-                const id = attackId(attack, `${pageCount}:${i}:${ts}`);
-                if (seen.has(id)) continue;
-                seen.add(id);
-                fetchedCount += 1;
-                if (ts && (ts < range.from || ts > range.to)) continue;
-                addAttack(aggregates, attack, wars);
+            while (nextUrl && cursorTo >= gapFrom) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                if (seenPageUrls.has(nextUrl)) {
+                    gapComplete = false;
+                    break;
+                }
+                seenPageUrls.add(nextUrl);
+
+                const payload = await gmJson(nextUrl);
+                pageCount += 1;
+
+                const attacks = extractAttacks(payload);
+                const compactPage = [];
+                let oldestTs = 0;
+                for (let i = 0; i < attacks.length; i++) {
+                    const raw = attacks[i];
+                    const ts = attackEndTs(raw);
+                    if (ts && (!oldestTs || ts < oldestTs)) oldestTs = ts;
+                    const compact = compactAttackForHistory(raw, `${pageCount}:${i}:${ts}`);
+                    if (!compact.id || gapSeen.has(compact.id)) continue;
+                    gapSeen.add(compact.id);
+                    if (compact.ended && (compact.ended < gapFrom || compact.ended > gapTo)) continue;
+                    compactPage.push(compact);
+                    fetchedRows.push(compact);
+                }
+                await historyPutRecords('attacks', compactPage, row => row.id, row => row.ended);
+                onProgress?.(pageCount, fetchedRows.length, missingRanges.length, r + 1, 0);
+
+                if (!attacks.length) break;
+
+                // Prefer Torn's own cursor/next link. It preserves records that share the
+                // same ended timestamp, which a naive oldestTimestamp-1 paginator can skip.
+                const apiNext = cleanNextUrl(payload?._metadata?.links?.next);
+                if (apiNext) {
+                    nextUrl = apiNext;
+                } else if (attacks.length >= 100 && oldestTs && oldestTs > gapFrom) {
+                    const nextTo = oldestTs - 1;
+                    if (nextTo >= cursorTo) {
+                        gapComplete = false;
+                        break;
+                    }
+                    cursorTo = nextTo;
+                    nextUrl = apiUrl('/faction/attacks', {
+                        filters: 'outgoing',
+                        limit: 100,
+                        sort: 'DESC',
+                        from: gapFrom,
+                        to: cursorTo
+                    });
+                } else {
+                    nextUrl = null;
+                }
+
+                if (pageCount > 6000) throw new Error('Attack pagination exceeded the safety limit (6,000 pages).');
             }
+            if (gapComplete) await historyMarkCoverage('attacks', gapFrom, gapTo);
+        }
 
-            onProgress?.(pageCount, fetchedCount);
-            if (!attacks.length || attacks.length < 100 || !oldestTs || oldestTs <= range.from) break;
-            const nextTo = oldestTs - 1;
-            if (nextTo >= cursorTo) break;
-            cursorTo = nextTo;
-            if (pageCount > 6000) throw new Error('Attack pagination exceeded the safety limit (6,000 pages).');
+        const cachedRows = await historyGetRecords('attacks', range.from, range.to);
+        const allById = new Map();
+        for (const row of cachedRows) if (row?.id) allById.set(String(row.id), row);
+        for (const row of fetchedRows) if (row?.id) allById.set(String(row.id), row);
+        const allAttacks = Array.from(allById.values()).sort((a, b) => num(a.ended) - num(b.ended));
+        const fetchedIdSet = new Set(fetchedRows.map(row => String(row.id)));
+        const cacheReuseCount = allAttacks.reduce((n, row) => n + (fetchedIdSet.has(String(row.id)) ? 0 : 1), 0);
+
+        for (let i = 0; i < allAttacks.length; i++) {
+            if (state.abortScan) throw new Error('Scan cancelled.');
+            const attack = allAttacks[i];
+            addAttack(aggregates, attack, wars);
+            if (i % 1000 === 0) onProgress?.(pageCount, allAttacks.length, missingRanges.length, missingRanges.length, cacheReuseCount);
         }
 
         for (const member of state.members) {
@@ -3496,7 +3894,15 @@
             stat.warsWithWarHits = Object.values(stat.warBreakdown || {}).filter(w => num(w.warHits) > 0).length;
         }
 
-        return { aggregates, pageCount, fetchedCount };
+        return {
+            aggregates,
+            pageCount,
+            fetchedCount: allAttacks.length,
+            apiFetchedCount: fetchedRows.length,
+            cacheReuseCount,
+            missingRangeCount: missingRanges.length,
+            attacks: allAttacks
+        };
     }
 
     function freshOcAgg() {
@@ -3528,88 +3934,116 @@
         return String(crime?.status ?? crime?.outcome ?? '').trim().toLowerCase();
     }
 
+    function compactCrimeForHistory(crime, fallback) {
+        const ts = crimeExecutedTs(crime);
+        const slots = (Array.isArray(crime?.slots) ? crime.slots : Object.values(crime?.slots || {}))
+            .map(slot => ({ user: { id: crimeSlotUserId(slot) } }))
+            .filter(slot => num(slot?.user?.id) > 0);
+        return {
+            id: String(crime?.id ?? crime?.crime_id ?? fallback ?? ''),
+            executed_at: ts,
+            status: String(crime?.status ?? crime?.outcome ?? ''),
+            slots
+        };
+    }
+
     async function scanFactionCrimes(range, onProgress) {
         const aggregates = {};
         for (const member of state.members) aggregates[Number(member.id)] = freshOcAgg();
 
-        const seen = new Set();
         let pageCount = 0;
-        let crimeCount = 0;
-        let cursorTo = range.to;
+        const fetchedRows = [];
+        const missingRanges = await historyMissingRanges('crimes', range.from, range.to);
 
-        while (cursorTo >= range.from) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
+        for (let r = 0; r < missingRanges.length; r++) {
+            const [gapFrom, gapTo] = missingRanges[r];
+            let cursorTo = gapTo;
+            let gapComplete = true;
+            const gapSeen = new Set();
 
-            // Timestamp-cursor pagination avoids Torn's known repeated-page behaviour
-            // when OC queries combine historical filters with offset/auto links.
-            const payload = await gmJson(apiUrl('/faction/crimes', {
-                cat: 'completed',
-                filters: 'executed_at',
-                limit: 100,
-                sort: 'DESC',
-                from: range.from,
-                to: cursorTo
-            }));
+            while (cursorTo >= gapFrom) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                const payload = await gmJson(apiUrl('/faction/crimes', {
+                    cat: 'completed',
+                    filters: 'executed_at',
+                    limit: 100,
+                    sort: 'DESC',
+                    from: gapFrom,
+                    to: cursorTo
+                }));
+                pageCount += 1;
+                const crimes = extractCrimes(payload);
+                const compactPage = [];
+                let oldestTs = 0;
 
-            pageCount += 1;
-            const crimes = extractCrimes(payload);
-            let oldestTs = 0;
-
-            for (let i = 0; i < crimes.length; i++) {
-                const crime = crimes[i];
-                const ts = crimeExecutedTs(crime);
-                if (ts && (!oldestTs || ts < oldestTs)) oldestTs = ts;
-
-                const id = String(crime?.id ?? crime?.crime_id ?? `${pageCount}:${i}:${ts}`);
-                if (seen.has(id)) continue;
-                seen.add(id);
-
-                if (ts && (ts < range.from || ts > range.to)) continue;
-                crimeCount += 1;
-
-                const outcome = crimeOutcome(crime);
-                const success = outcome === 'successful' || outcome === 'success';
-                const failure = outcome === 'failed' || outcome === 'failure';
-                const slots = Array.isArray(crime?.slots) ? crime.slots : Object.values(crime?.slots || {});
-                const credited = new Set();
-
-                for (const slot of slots) {
-                    const uid = crimeSlotUserId(slot);
-                    if (!uid || credited.has(uid)) continue;
-                    credited.add(uid);
-                    if (!aggregates[uid]) aggregates[uid] = freshOcAgg();
-                    const stat = aggregates[uid];
-                    stat.participated += 1;
-                    if (success) stat.successful += 1;
-                    else if (failure) stat.failed += 1;
-                    else stat.other += 1;
-
-                    if (ts) {
-                        if (!stat.firstOcTs || ts < stat.firstOcTs) stat.firstOcTs = ts;
-                        if (!stat.lastOcTs || ts > stat.lastOcTs) stat.lastOcTs = ts;
-                    }
+                for (let i = 0; i < crimes.length; i++) {
+                    const raw = crimes[i];
+                    const ts = crimeExecutedTs(raw);
+                    if (ts && (!oldestTs || ts < oldestTs)) oldestTs = ts;
+                    const compact = compactCrimeForHistory(raw, `${pageCount}:${i}:${ts}`);
+                    if (!compact.id || gapSeen.has(compact.id)) continue;
+                    gapSeen.add(compact.id);
+                    if (compact.executed_at && (compact.executed_at < gapFrom || compact.executed_at > gapTo)) continue;
+                    compactPage.push(compact);
+                    fetchedRows.push(compact);
                 }
+                await historyPutRecords('crimes', compactPage, row => row.id, row => row.executed_at);
+                onProgress?.(pageCount, fetchedRows.length, 0, missingRanges.length, r + 1);
+
+                if (!crimes.length || crimes.length < 100 || !oldestTs || oldestTs <= gapFrom) break;
+                const nextTo = oldestTs - 1;
+                if (nextTo >= cursorTo) {
+                    gapComplete = false;
+                    break;
+                }
+                cursorTo = nextTo;
+                if (pageCount > 6000) throw new Error('OC pagination exceeded the safety limit (6,000 pages).');
             }
-
-            onProgress?.(pageCount, crimeCount);
-
-            if (!crimes.length || crimes.length < 100 || !oldestTs || oldestTs <= range.from) break;
-
-            const nextTo = oldestTs - 1;
-            if (nextTo >= cursorTo) {
-                // Torn returned a page that cannot move the cursor backwards.
-                // Keep the data already collected instead of failing the whole report.
-                break;
-            }
-
-            cursorTo = nextTo;
-
-            if (pageCount > 6000) {
-                throw new Error('OC pagination exceeded the safety limit (6,000 pages).');
-            }
+            if (gapComplete) await historyMarkCoverage('crimes', gapFrom, gapTo);
         }
 
-        return { aggregates, pageCount, crimeCount };
+        const cachedRows = await historyGetRecords('crimes', range.from, range.to);
+        const allById = new Map();
+        for (const row of cachedRows) if (row?.id) allById.set(String(row.id), row);
+        for (const row of fetchedRows) if (row?.id) allById.set(String(row.id), row);
+        const allCrimes = Array.from(allById.values()).sort((a, b) => num(a.executed_at) - num(b.executed_at));
+        const fetchedIdSet = new Set(fetchedRows.map(row => String(row.id)));
+        const cacheReuseCount = allCrimes.reduce((n, row) => n + (fetchedIdSet.has(String(row.id)) ? 0 : 1), 0);
+
+        for (const crime of allCrimes) {
+            const ts = crimeExecutedTs(crime);
+            const outcome = crimeOutcome(crime);
+            const success = outcome === 'successful' || outcome === 'success';
+            const failure = outcome === 'failed' || outcome === 'failure';
+            const slots = Array.isArray(crime?.slots) ? crime.slots : Object.values(crime?.slots || {});
+            const credited = new Set();
+
+            for (const slot of slots) {
+                const uid = crimeSlotUserId(slot);
+                if (!uid || credited.has(uid)) continue;
+                credited.add(uid);
+                if (!aggregates[uid]) aggregates[uid] = freshOcAgg();
+                const stat = aggregates[uid];
+                stat.participated += 1;
+                if (success) stat.successful += 1;
+                else if (failure) stat.failed += 1;
+                else stat.other += 1;
+                if (ts) {
+                    if (!stat.firstOcTs || ts < stat.firstOcTs) stat.firstOcTs = ts;
+                    if (!stat.lastOcTs || ts > stat.lastOcTs) stat.lastOcTs = ts;
+                }
+            }
+        }
+        onProgress?.(pageCount, allCrimes.length, cacheReuseCount, missingRanges.length, missingRanges.length);
+
+        return {
+            aggregates,
+            pageCount,
+            crimeCount: allCrimes.length,
+            apiFetchedCount: fetchedRows.length,
+            cacheReuseCount,
+            missingRangeCount: missingRanges.length
+        };
     }
 
     function freshArmoryXanaxAgg() {
@@ -3686,74 +4120,108 @@
         }
     }
 
+    function compactArmoryNewsForHistory(entry, fallback) {
+        const ts = num(entry?.timestamp ?? entry?.time ?? 0);
+        const text = String(entry?.text ?? entry?.news ?? '');
+        const isXanax = isArmoryXanaxUse(text);
+        return {
+            id: String(entry?.id ?? fallback ?? ''),
+            timestamp: ts,
+            text,
+            isXanax,
+            memberId: isXanax ? armoryNewsMemberId(text) : 0,
+            qty: isXanax ? armoryXanaxQuantity(text) : 0
+        };
+    }
+
     async function scanFactionArmoryXanax(range, onProgress) {
         const aggregates = {};
         for (const member of state.members) aggregates[Number(member.id)] = freshArmoryXanaxAgg();
 
-        const seen = new Set();
         let pageCount = 0;
-        let newsCount = 0;
-        let cursorTo = range.to;
+        const fetchedRows = [];
+        const missingRanges = await historyMissingRanges('armory', range.from, range.to);
 
-        while (cursorTo >= range.from) {
-            if (state.abortScan) throw new Error('Scan cancelled.');
+        for (let r = 0; r < missingRanges.length; r++) {
+            const [gapFrom, gapTo] = missingRanges[r];
+            let cursorTo = gapTo;
+            let gapComplete = true;
+            const gapSeen = new Set();
 
-            const payload = await gmJson(apiUrl('/faction/news', {
-                cat: 'armoryAction',
-                striptags: 'false',
-                limit: 100,
-                sort: 'DESC',
-                from: range.from,
-                to: cursorTo
-            }));
+            while (cursorTo >= gapFrom) {
+                if (state.abortScan) throw new Error('Scan cancelled.');
+                const payload = await gmJson(apiUrl('/faction/news', {
+                    cat: 'armoryAction',
+                    striptags: 'false',
+                    limit: 100,
+                    sort: 'DESC',
+                    from: gapFrom,
+                    to: cursorTo
+                }));
+                pageCount += 1;
+                const news = extractFactionNews(payload);
+                const compactPage = [];
+                let oldestTs = 0;
 
-            pageCount += 1;
-            const news = extractFactionNews(payload);
-            let oldestTs = 0;
-
-            for (let i = 0; i < news.length; i++) {
-                const entry = news[i];
-                const ts = num(entry?.timestamp ?? entry?.time ?? 0);
-                if (ts && (!oldestTs || ts < oldestTs)) oldestTs = ts;
-                if (ts && (ts < range.from || ts > range.to)) continue;
-
-                const id = String(entry?.id ?? `${pageCount}:${i}:${ts}:${entry?.text ?? ''}`);
-                if (seen.has(id)) continue;
-                seen.add(id);
-                newsCount += 1;
-
-                const text = String(entry?.text ?? entry?.news ?? '');
-                if (!isArmoryXanaxUse(text)) continue;
-
-                const uid = armoryNewsMemberId(text);
-                if (!uid) continue;
-                if (!aggregates[uid]) aggregates[uid] = freshArmoryXanaxAgg();
-
-                const qty = armoryXanaxQuantity(text);
-                const stat = aggregates[uid];
-                stat.used += qty;
-                stat.events += 1;
-                if (ts) {
-                    if (!stat.firstTs || ts < stat.firstTs) stat.firstTs = ts;
-                    if (!stat.lastTs || ts > stat.lastTs) stat.lastTs = ts;
+                for (let i = 0; i < news.length; i++) {
+                    const entry = news[i];
+                    const ts = num(entry?.timestamp ?? entry?.time ?? 0);
+                    if (ts && (!oldestTs || ts < oldestTs)) oldestTs = ts;
+                    const compact = compactArmoryNewsForHistory(entry, `${pageCount}:${i}:${ts}:${entry?.text ?? ''}`);
+                    if (!compact.id || gapSeen.has(compact.id)) continue;
+                    gapSeen.add(compact.id);
+                    if (compact.timestamp && (compact.timestamp < gapFrom || compact.timestamp > gapTo)) continue;
+                    compactPage.push(compact);
+                    fetchedRows.push(compact);
                 }
+                await historyPutRecords('armory', compactPage, row => row.id, row => row.timestamp);
+                onProgress?.(pageCount, fetchedRows.length, 0, missingRanges.length, r + 1);
+
+                if (!news.length || news.length < 100 || !oldestTs || oldestTs <= gapFrom) break;
+                const nextTo = oldestTs - 1;
+                if (nextTo >= cursorTo) {
+                    gapComplete = false;
+                    break;
+                }
+                cursorTo = nextTo;
+                if (pageCount > 6000) throw new Error('Armory-news pagination exceeded the safety limit (6,000 pages).');
             }
-
-            onProgress?.(pageCount, newsCount);
-
-            if (!news.length || news.length < 100 || !oldestTs || oldestTs <= range.from) break;
-
-            const nextTo = oldestTs - 1;
-            if (nextTo >= cursorTo) break;
-
-            cursorTo = nextTo;
-
-            if (pageCount > 6000) {
-                throw new Error('Armory-news pagination exceeded the safety limit (6,000 pages).');
-            }
+            if (gapComplete) await historyMarkCoverage('armory', gapFrom, gapTo);
         }
 
-        return { aggregates, pageCount, newsCount };
+        const cachedRows = await historyGetRecords('armory', range.from, range.to);
+        const allById = new Map();
+        for (const row of cachedRows) if (row?.id) allById.set(String(row.id), row);
+        for (const row of fetchedRows) if (row?.id) allById.set(String(row.id), row);
+        const allNews = Array.from(allById.values()).sort((a, b) => num(a.timestamp) - num(b.timestamp));
+        const fetchedIdSet = new Set(fetchedRows.map(row => String(row.id)));
+        const cacheReuseCount = allNews.reduce((n, row) => n + (fetchedIdSet.has(String(row.id)) ? 0 : 1), 0);
+
+        for (const entry of allNews) {
+            if (!entry?.isXanax) continue;
+            const uid = num(entry?.memberId, 0) || armoryNewsMemberId(entry?.text || '');
+            if (!uid) continue;
+            if (!aggregates[uid]) aggregates[uid] = freshArmoryXanaxAgg();
+            const qty = Math.max(1, num(entry?.qty, 1));
+            const ts = num(entry?.timestamp, 0);
+            const stat = aggregates[uid];
+            stat.used += qty;
+            stat.events += 1;
+            if (ts) {
+                if (!stat.firstTs || ts < stat.firstTs) stat.firstTs = ts;
+                if (!stat.lastTs || ts > stat.lastTs) stat.lastTs = ts;
+            }
+        }
+        onProgress?.(pageCount, allNews.length, cacheReuseCount, missingRanges.length, missingRanges.length);
+
+        return {
+            aggregates,
+            pageCount,
+            newsCount: allNews.length,
+            apiFetchedCount: fetchedRows.length,
+            cacheReuseCount,
+            missingRangeCount: missingRanges.length
+        };
     }
 
     function loadXanaxCacheStore() {
@@ -3956,9 +4424,11 @@ ${clone.outerHTML}
                     <td>${fmt(c.chain)}</td>
                     <td>${fmt(c.hits)}</td>
                     <td>${fmt(c.totalAttacks)}</td>
+                    <td>${fmt(c.assists || 0)}</td>
+                    <td>${fmt(c.losses || 0)}</td>
                     <td>${fmt(c.respect, 2)}</td>
                 </tr>
-            `).join('') || `<tr><td colspan="5">${chainSummaryAvailable ? 'No completed-chain participation was found for this member in the selected period.' : 'Chain participation was not included in this saved scan. Run this period again to add chain data.'}</td></tr>`;
+            `).join('') || `<tr><td colspan="7">${chainSummaryAvailable ? 'No completed-chain participation was found for this member in the selected period.' : 'Chain participation was not included in this saved scan. Run this period again to add chain data.'}</td></tr>`;
 
         const warRows = Object.values(s.warBreakdown || {})
             .sort((a, b) => num(a.start) - num(b.start))
@@ -4076,12 +4546,12 @@ ${clone.outerHTML}
                     <div class="bftd-fws-stat"><div class="v">${chainSummaryAvailable ? fmt(meta.chainSummary?.chainCount || 0) : '—'}</div><div class="k">FACTION CHAINS IN PERIOD</div></div>
                 </div>
                 <div style="overflow:auto">
-                    <table class="bftd-fws-table" style="min-width:660px">
-                        <thead><tr><th>CHAIN / DATE</th><th>CHAIN SIZE</th><th>MEMBER HITS</th><th>REPORT ATTACKS</th><th>RESPECT</th></tr></thead>
+                    <table class="bftd-fws-table" style="min-width:840px">
+                        <thead><tr><th>CHAIN / DATE</th><th>CHAIN SIZE</th><th>MEMBER HITS</th><th>ATTACKS IN WINDOW</th><th>ASSISTS</th><th>LOSSES</th><th>CHAIN-HIT RESPECT</th></tr></thead>
                         <tbody>${chainRows}</tbody>
                     </table>
                 </div>
-                <div class="bftd-fws-note" style="margin-top:8px">Member hits use the chain report's successful leave + mug + hospitalize attack results. REPORT ATTACKS is also shown separately for transparency.</div>
+                <div class="bftd-fws-note" style="margin-top:8px">Chain participation is rebuilt locally after the detailed attack scan. MEMBER HITS counts only unique outgoing successful attacks that Torn itself marks with a positive chain position inside the matching completed-chain window. Assists, losses, escapes, stalemates, interrupted attacks and ordinary attacks during the window do not count as participation.</div>
             </div>
 
             <div class="bftd-fws-card">
@@ -4111,10 +4581,11 @@ ${clone.outerHTML}
                     Xanax snapshot totals: ${xanaxLoaded ? `<b>${fmt(xanax.startTotal)}</b> → <b>${fmt(xanax.endTotal)}</b>` : '<b>Not loaded — use the button below to spend 2 API calls.</b>'}<br>
                     Faction armory Xanax: <b>${fmt(armoryXanax.used || 0)}</b> across <b>${fmt(armoryXanax.events || 0)}</b> armory log event(s)<br>
                     Ranked-war scan: <b>${fmt(meta.warSummary?.warCount || 0)}</b> wars; <b>${fmt(meta.warSummary?.historyPages || 0)}</b> history page(s); <b>${fmt(meta.warSummary?.reportApiCalls || 0)}</b> new war-report API call(s); <b>${fmt(meta.warSummary?.reportCacheHits || 0)}</b> cached war report(s)<br>
-                    Chain scan: ${chainSummaryAvailable ? `<b>${fmt(meta.chainSummary?.chainCount || 0)}</b> completed chain(s); <b>${fmt(meta.chainSummary?.historyPages || 0)}</b> history page(s); <b>${fmt(meta.chainSummary?.reportApiCalls || 0)}</b> new chain-report API call(s); <b>${fmt(meta.chainSummary?.reportCacheHits || 0)}</b> cached chain report(s)` : '<b>Not included in this saved scan</b>'}<br>
-                    Attack scan: <b>${fmt(meta.pageCount)}</b> page(s) / <b>${fmt(meta.fetchedCount)}</b> outgoing attacks checked<br>
-                    OC scan: <b>${fmt(meta.ocPageCount)}</b> page(s) / <b>${fmt(meta.ocCount)}</b> completed OCs checked<br>
-                    Armory scan: <b>${fmt(meta.armoryPageCount)}</b> page(s) / <b>${fmt(meta.armoryNewsCount)}</b> records checked<br>
+                    Chain scan: ${chainSummaryAvailable ? `<b>${fmt(meta.chainSummary?.chainCount || 0)}</b> completed chain(s); <b>${fmt(meta.chainSummary?.historyPages || 0)}</b> new chain-history API page(s); <b>0</b> per-chain report calls; participation strictly validated locally from the completed attack data` : '<b>Not included in this saved scan</b>'}<br>
+                    Local history reuse: <b>${fmt(meta.historyCacheStats?.attacks?.reused || 0)}</b> attack(s), <b>${fmt(meta.historyCacheStats?.crimes?.reused || 0)}</b> OC(s), <b>${fmt(meta.historyCacheStats?.armory?.reused || 0)}</b> armory record(s)<br>
+                    Attack scan: <b>${fmt(meta.pageCount)}</b> new API page(s) / <b>${fmt(meta.fetchedCount)}</b> outgoing attacks checked<br>
+                    OC scan: <b>${fmt(meta.ocPageCount)}</b> new API page(s) / <b>${fmt(meta.ocCount)}</b> completed OCs checked<br>
+                    Armory scan: <b>${fmt(meta.armoryPageCount)}</b> new API page(s) / <b>${fmt(meta.armoryNewsCount)}</b> records checked<br>
                     Scan generated: <b>${esc(generatedText)}</b>
                 </div>
             </div>
